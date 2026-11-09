@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-upstream/
+*.log
+.env
+.env.*
+!.env.example
+review.diff
+review.md
+manifest.json
+gitleaks-report.*

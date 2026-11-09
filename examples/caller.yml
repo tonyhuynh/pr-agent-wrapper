@@ -1,0 +1,16 @@
+name: PR-Agent review
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+permissions:
+  contents: read
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
+    with:
+      extra_instructions: Focus on the workflow, package.json and docs.
+    secrets:
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}

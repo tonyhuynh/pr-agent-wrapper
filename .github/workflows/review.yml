@@ -1,0 +1,617 @@
+name: PR-Agent review
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: xai/grok-4.7
+      fallback_models:
+        type: string
+        default: '[]'
+      extra_instructions:
+        type: string
+        default: ''
+      num_max_findings:
+        type: number
+        default: 3
+      ignore_globs:
+        type: string
+        default: '["vendor/**"]'
+    secrets:
+      XAI_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+permissions:
+  contents: read
+jobs:
+  capture:
+    if: >-
+      contains(fromJSON('["pull_request_target","pull_request"]'), github.event_name) &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["opened","reopened","synchronize","ready_for_review"]'), github.event.action)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      captured: ${{ steps.capture.outputs.captured }}
+      providers: ${{ steps.capture.outputs.providers }}
+      merge_base: ${{ steps.capture.outputs.merge_base }}
+      diff_sha256: ${{ steps.capture.outputs.diff_sha256 }}
+    steps:
+      - name: Capture diff and save runtime
+        id: capture
+        env:
+          INPUTS_JSON: ${{ toJSON(inputs) }}
+          GH_READ_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/prw-runtime.py" <<'PRW_REVIEW_PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+          import urllib.request
+
+          UPSTREAM = "efdde4afe14aa401a3889012c7f3e9ef3081a430"
+          SOURCE_BLOBS = {
+              "docker/Dockerfile": "5eec5307216ba9c69f35a6a84c1759e64f313f17",
+              "pr_agent/cli.py": "3d50c83220853ac599a27aa89a582b009a01f645",
+              "pr_agent/config_loader.py": "873b2d3b09dfb9ee89c1b07a886da461c08642d1",
+              "pr_agent/custom_merge_loader.py": "b97952089c4da53423b9b967e7a6f160f33a0f9c",
+              "pr_agent/settings/configuration.toml": "011c0cdad1448ce102f99d983f4ddd0f5667f6cd",
+              "pr_agent/settings/ignore.toml": "314fd637aec658b537d93cee3a04f62035bc8ce8",
+              "pr_agent/algo/pr_processing.py": "2d081b7bdd62e432d8c9b5545496d8373be72e8d",
+              "pr_agent/algo/ai_handlers/litellm_ai_handler.py": "004359f8dc0e40c679c9803416cc91ca7771e71a",
+              "pr_agent/git_providers/plain_diff_provider.py": "40a8f2735de369eab1575ba69e6fe5dd1bb39af0",
+              "pr_agent/algo/run_output.py": "b22b60555f6889ea70448a6134458a7d877124bb",
+              "pr_agent/algo/run_details.py": "c3ef863b2d571d287fe9bfcabf864b56d1277458",
+              "uv.lock": "5f67de304a16ea51a8532ecf775a166426774195",
+          }
+          IMAGE = "pr-agent-wrapper:local"
+          MAX_DIFF = 4 * 1024 * 1024
+          MAX_REVIEW = 8 * 1024 * 1024
+          COMMENT_LIMIT = 60000
+          KEYS = {
+              "xai": ("XAI_API_KEY", "XAI__KEY"),
+              "openai": ("OPENAI_API_KEY", "OPENAI__KEY"),
+              "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC__KEY"),
+              "gemini": ("GEMINI_API_KEY", "GOOGLE_AI_STUDIO__GEMINI_API_KEY"),
+          }
+          FIXED = {
+              "pr_reviewer.persistent_comment": False,
+              "pr_reviewer.persistent_finding_state": False,
+              "pr_reviewer.final_update_message": False,
+              "pr_reviewer.publish_output_no_suggestions": True,
+              "pr_reviewer.inline_key_issues": False,
+              "pr_reviewer.enable_review_labels_security": False,
+              "pr_reviewer.enable_review_labels_effort": False,
+              "pr_reviewer.enable_large_pr_chunking": False,
+              "config.publish_output_progress": False,
+              "config.output_run_details": True,
+              "config.enable_auto_approval": False,
+              "config.num_retries": 0,
+              "config.ai_timeout": 120,
+              "config.retry_same_model_on_timeout": False,
+              "config.retry_same_model_on_length": False,
+              "config.use_repo_settings_file": False,
+              "config.use_global_settings_file": False,
+              "config.use_group_settings_file": False,
+              "config.global_settings_repo": "",
+              "config.enable_per_directory_settings": False,
+              "config.extra_config_url": "",
+              "config.repo_context_files": [],
+              "config.repo_context_sibling_repos": [],
+              "config.secret_provider": "",
+              "config.propagate_tool_errors": True,
+              "config.log_level": "CRITICAL",
+              "config.verbosity_level": 0,
+              "config.output_relevant_configurations": False,
+              "config.persistent_inline_comments": False,
+              "model_routing.enable": False,
+              "model_routing.rules": [],
+              "litellm.custom_llm_provider": "",
+              "litellm.enable_callbacks": False,
+              "litellm.success_callback": [],
+              "litellm.failure_callback": [],
+              "litellm.service_callback": [],
+              "litellm.turn_off_message_logging": True,
+              "otel.is_enabled": False,
+              "otel.exporter_type": "none",
+              "skills.enabled": False,
+              "skills.paths": [],
+              "artifacts.enable": False,
+              "artifacts.artifact_path": "",
+              "github.publish_as_check_run": False,
+              "push_outputs.enable": False,
+              "push_outputs.channels": [],
+          }
+
+
+          def require(value, message):
+              if not value:
+                  raise ValueError(message)
+              return value
+
+
+          def safe_text(value, limit, multiline=False):
+              require(isinstance(value, str) and len(value.encode("utf-8")) <= limit, "Invalid text size or type")
+              require(not re.search(r"@[A-Za-z]", value), "Dynaconf directive forms are forbidden")
+              require(not any(ord(c) < 32 and (not multiline or c not in "\n\t") for c in value), "Control characters forbidden")
+              require("\x7f" not in value, "Control characters forbidden")
+              return value
+
+
+          def model(value):
+              safe_text(value, 160)
+              require(re.fullmatch(r"(xai|openai|anthropic|gemini)/[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value), "Unsupported provider or model format")
+              return value
+
+
+          def array_text(value, count, item_limit):
+              safe_text(value, 8192, True)
+              parsed = json.loads(value)
+              require(type(parsed) is list and len(parsed) <= count, "Expected bounded JSON array")
+              for item in parsed:
+                  safe_text(item, item_limit)
+                  require(bool(item.strip()), "Empty array item")
+              require(len(set(parsed)) == len(parsed), "Duplicate array item")
+              return parsed
+
+
+          def settings(inputs):
+              require(set(inputs) == {"model", "fallback_models", "extra_instructions", "num_max_findings", "ignore_globs"}, "Unexpected inputs")
+              primary = model(inputs["model"])
+              fallbacks = array_text(inputs["fallback_models"], 4, 160)
+              for item in fallbacks:
+                  model(item)
+              require(primary not in fallbacks, "Duplicate primary model")
+              count = inputs["num_max_findings"]
+              require(type(count) is int and 1 <= count <= 10, "num_max_findings must be an integer from 1 to 10")
+              globs = array_text(inputs["ignore_globs"], 32, 256)
+              # Keep the native vendor exclusion even when callers add patterns.
+              globs = list(dict.fromkeys(["vendor/**", *globs]))
+              return {**FIXED, "config.model": primary, "config.fallback_models": fallbacks,
+                      "pr_reviewer.extra_instructions": safe_text(inputs["extra_instructions"], 8192, True),
+                      "pr_reviewer.num_max_findings": count, "ignore.glob": globs}
+
+
+          def serialize(config):
+              return {key.upper().replace(".", "__"): "@json " + json.dumps(value, ensure_ascii=True)
+                      for key, value in config.items()}
+
+
+          SECRET_ERROR_MESSAGES = {
+              public: "Missing required workflow secret: " + public + ". Configure it before inference."
+              for public, _ in KEYS.values()
+          }
+
+
+          class MissingProviderSecret(ValueError):
+              def __init__(self, secret_name):
+                  require(secret_name in SECRET_ERROR_MESSAGES, "Unknown provider secret name")
+                  self.secret_name = secret_name
+                  super().__init__(SECRET_ERROR_MESSAGES[secret_name])
+
+
+          def provider_keys(config, environment):
+              result = {}
+              for item in [config["config.model"], *config["config.fallback_models"]]:
+                  public, native = KEYS[item.split("/", 1)[0]]
+                  value = environment.get(public, "")
+                  if not isinstance(value, str) or not value.strip():
+                      raise MissingProviderSecret(public)
+                  safe_text(value, 8192)
+                  result[native] = "@json " + json.dumps(value)
+              return result
+
+
+          def oid(value):
+              require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value), "Invalid Git object ID")
+              return value
+
+
+          def identity(event, repository, event_name):
+              require(event_name in {"pull_request_target", "pull_request"}, "Only PR events are accepted")
+              require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", repository)
+                      and repository.split("/")[1] not in {".", ".."}, "Invalid repository")
+              require(event.get("action") in {"opened", "reopened", "synchronize", "ready_for_review"}, "Unsupported event action")
+              pr = event["pull_request"]
+              require(event["repository"]["full_name"] == repository, "Repository mismatch")
+              require(pr["base"]["repo"]["full_name"] == repository, "Base repository mismatch")
+              require(pr["head"]["repo"]["full_name"] == repository and pr["head"]["repo"]["fork"] is False, "Fork PRs are excluded")
+              require(pr["draft"] is False and pr["state"] == "open", "Draft or closed PRs are excluded")
+              number = event["number"]
+              require(type(number) is int and number > 0 and type(pr["number"]) is int and pr["number"] == number, "Invalid PR number")
+              # Derive the URL from a validated repository; never trust metadata URLs.
+              return {"repository": repository, "pr_number": number, "base": oid(pr["base"]["sha"]), "head": oid(pr["head"]["sha"])}
+
+
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+
+
+          def clean_env(root):
+              home = root / "home"
+              home.mkdir(exist_ok=True)
+              return {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(home), "LANG": "C.UTF-8",
+                      "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                      "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1",
+                      "DOCKER_CONFIG": str(home)}
+
+
+          def git_diff(meta, root, token, run=subprocess.run):
+              bare = root / "objects.git"
+              env = clean_env(root)
+              # Configuration is isolated without changing or bypassing hooks.
+              def git(*args):
+                  p = run(["git", "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never",
+                           *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=300)
+                  return p.stdout
+              git("init", "--bare", str(bare))
+              if token:
+                  import base64
+                  env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                              "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic " + base64.b64encode(("x-access-token:" + token).encode()).decode()})
+              url = "https://github.com/" + meta["repository"] + ".git"
+              # Full ancestry is needed for an exact merge base. No checkout or mutable refs.
+              git("--git-dir=" + str(bare), "fetch", "--no-tags", "--no-recurse-submodules", url, meta["base"], meta["head"])
+              for sha in (meta["base"], meta["head"]):
+                  require(git("--git-dir=" + str(bare), "cat-file", "-t", sha).strip() == b"commit", "Object is not a commit")
+              bases = git("--git-dir=" + str(bare), "merge-base", "--all", meta["base"], meta["head"]).decode().splitlines()
+              require(len(bases) == 1, "Ambiguous or missing merge base")
+              merge_base = oid(bases[0])
+              patch = git("--git-dir=" + str(bare), "-c", "diff.renames=false", "diff", "--no-ext-diff", "--no-textconv",
+                          "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--ignore-submodules=all",
+                          merge_base, meta["head"], "--")
+              require(len(patch) <= MAX_DIFF, "Diff exceeds 4 MiB")
+              patch.decode("utf-8")
+              shutil.rmtree(bare)
+              return merge_base, patch
+
+
+          def prepare(root):
+              root.mkdir()
+              config = settings(json.loads(os.environ["INPUTS_JSON"]))
+              meta = identity(json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()), os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_EVENT_NAME"])
+              for key in ("run_id", "run_attempt"):
+                  value = os.environ["GITHUB_" + key.upper()]
+                  require(re.fullmatch(r"[1-9][0-9]*", value), "Invalid run identity")
+                  meta[key] = value
+              merge_base, patch = git_diff(meta, root, os.environ.get("GH_READ_TOKEN", ""))
+              meta.update({"schema": 1, "upstream": UPSTREAM, "merge_base": merge_base, "diff_sha256": digest(patch),
+                           "status": "not_run", "review_sha256": digest(b"")})
+              (root / "input").mkdir()
+              (root / "artifact").mkdir()
+              (root / "output").mkdir(mode=0o777)
+              (root / "output").chmod(0o777)
+              (root / "input/review.diff").write_bytes(patch)
+              (root / "artifact/review.diff").write_bytes(patch)
+              (root / "artifact/review.md").write_bytes(b"")
+              (root / "config.json").write_text(json.dumps(config))
+              (root / "artifact/manifest.json").write_text(json.dumps(meta))
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  providers = sorted({m.split("/", 1)[0] for m in [config["config.model"], *config["config.fallback_models"]]})
+                  f.write("providers=" + json.dumps(providers) + "\n")
+                  f.write(f"captured=true\nmerge_base={merge_base}\ndiff_sha256={meta['diff_sha256']}\n")
+
+
+          def build(root):
+              # This step has no provider secrets or GitHub token in its environment.
+              source = root / "source"
+              source.mkdir()
+              archive = root / "source.tar.gz"
+              url = "https://codeload.github.com/The-PR-Agent/pr-agent/tar.gz/" + UPSTREAM
+              with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as f:
+                  total = 0
+                  while chunk := response.read(1024 * 1024):
+                      total += len(chunk)
+                      require(total <= 64 * 1024 * 1024, "Source archive too large")
+                      f.write(chunk)
+              with tarfile.open(archive) as tar:
+                  members = tar.getmembers()
+                  require(sum(m.size for m in members) <= 256 * 1024 * 1024, "Expanded source too large")
+                  prefix = "pr-agent-" + UPSTREAM
+                  for item in members:
+                      parts = Path(item.name).parts
+                      require(parts and parts[0] == prefix and ".." not in parts and not Path(item.name).is_absolute(), "Unsafe archive path")
+                      require(item.isfile() or item.isdir(), "Archive links and special files are forbidden")
+                  tar.extractall(source, members=members, filter="data")
+              source = source / ("pr-agent-" + UPSTREAM)
+              for name, expected in SOURCE_BLOBS.items():
+                  data = (source / name).read_bytes()
+                  actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+                  require(actual == expected, "Pinned source blob mismatch")
+              require(not list(source.rglob(".secrets.toml")), "Packaged credentials forbidden")
+              subprocess.run(["docker", "build", "--target", "cli", "--file", str(source / "docker/Dockerfile"),
+                              "--tag", IMAGE, str(source)], env=clean_env(root), check=True, timeout=900)
+              archive.unlink()
+              shutil.rmtree(source.parent)
+
+
+          def docker_command(root, names):
+              command = ["docker", "run", "--rm", "--name", "pr-agent-wrapper-review", "--read-only", "--user", "65532:65532",
+                         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=128", "--memory=4g", "--cpus=2",
+                         "--ulimit", "nofile=1024:1024", "--ulimit", "fsize=8388608:8388608", "--network=bridge",
+                         "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777",
+                         "--tmpfs", "/scratch:rw,noexec,nosuid,nodev,size=16m,mode=1777",
+                         "--workdir", "/scratch", "--mount", f"type=bind,src={root / 'input'},dst=/input,readonly",
+                         "--mount", f"type=bind,src={root / 'output'},dst=/output", "--entrypoint", "/app/.venv/bin/python"]
+              for name in sorted(names):
+                  command.extend(["--env", name])
+              return command + [IMAGE, "/app/pr_agent/cli.py", "--diff-file", "/input/review.diff", "--output", "/output/review.md", "review"]
+
+
+          def classify(data, config):
+              if not data.strip():
+                  return "empty_output"
+              text = data.decode("utf-8")
+              require("\x00" not in text, "Invalid output")
+              chain = [config["config.model"], *config["config.fallback_models"]]
+              lines = re.findall(r"^- Model: ([^\n\r]+)$", text, re.M)
+              expected = [m + (" (fallback)" if i else "") for i, m in enumerate(chain)]
+              if "Agent run details" not in text or len(lines) != 1 or lines[0] not in expected:
+                  return "missing_model_details"
+              return "oversized_output" if len(data) > COMMENT_LIMIT else "success"
+
+
+          def infer(root):
+              config = json.loads((root / "config.json").read_text())
+              manifest_path = root / "artifact/manifest.json"
+              meta = json.loads(manifest_path.read_text())
+              data = b""
+              status = "key_validation_failed"
+              try:
+                  credentials = provider_keys(config, os.environ)
+                  status = "inference_failed"
+                  env = {**clean_env(root), **serialize(config), **credentials, "HOME": "/tmp", "LOG_LEVEL": "CRITICAL",
+                         "LITELLM_LOCAL_MODEL_COST_MAP": "True", "TOKENIZERS_PARALLELISM": "false"}
+                  # docker client needs an isolated host HOME, while the container gets /tmp.
+                  names = set(serialize(config)) | set(credentials) | {"HOME", "LOG_LEVEL", "LITELLM_LOCAL_MODEL_COST_MAP", "TOKENIZERS_PARALLELISM"}
+                  env["HOME"] = str(root / "home")
+                  cmd = docker_command(root, names)
+                  # Explicit literal HOME avoids inheriting the Docker client's home path.
+                  cmd[cmd.index("HOME")] = "HOME=/tmp"
+                  try:
+                      completed = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+                  finally:
+                      subprocess.run(["docker", "rm", "--force", "pr-agent-wrapper-review"], env=clean_env(root),
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                  path = root / "output/review.md"
+                  if path.exists():
+                      require(not path.is_symlink() and path.is_file() and path.stat().st_size <= MAX_REVIEW, "Unsafe output file")
+                      data = path.read_bytes()
+                      # Do not upload a value that matches any supplied provider secret.
+                      require(not any(v and v.encode() in data for k, v in os.environ.items() if k in {p for p, _ in KEYS.values()}), "Secret in output")
+                      require("\x00" not in data.decode("utf-8"), "Invalid output encoding")
+                  status = classify(data, config) if completed.returncode == 0 else "inference_failed"
+              except MissingProviderSecret as error:
+                  # Emit only a fixed message indexed by an allowed secret name.
+                  print(SECRET_ERROR_MESSAGES.get(error.secret_name, "Provider secret validation failed."), file=sys.stderr)
+                  data = b""
+              except Exception:
+                  # Provider errors and output may contain credentials. Keep them out of logs.
+                  data = b""
+              (root / "artifact/review.md").write_bytes(data)
+              meta.update(status=status, review_sha256=digest(data))
+              manifest_path.write_text(json.dumps(meta))
+              require(status == "success", "Review failed: " + status)
+
+
+          if __name__ == "__main__":
+              try:
+                  root = Path(os.environ["RUNNER_TEMP"]) / "prw"
+                  {"prepare": prepare, "build": build, "infer": infer}[sys.argv[1]](root)
+              except Exception:
+                  print("Wrapper step failed; no provider details are logged.", file=sys.stderr)
+                  raise SystemExit(1)
+          PRW_REVIEW_PY
+          python3 "$RUNNER_TEMP/prw-runtime.py" prepare
+          cp "$RUNNER_TEMP/prw-runtime.py" "$RUNNER_TEMP/prw/runtime.py"
+      - name: Upload immutable input and workflow runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr-review-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prw/
+          if-no-files-found: error
+          retention-days: 3
+  review:
+    needs: capture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {}
+    steps:
+      - name: Download this attempt's immutable input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pr-review-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prw/
+      - name: Build pinned public source without credentials
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/prw/output"
+          chmod 777 "$RUNNER_TEMP/prw/output"
+          python3 "$RUNNER_TEMP/prw/runtime.py" build
+      - name: Preflight keys and run patch-only native review
+        env:
+          XAI_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'xai') && secrets.XAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'openai') && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'anthropic') && secrets.ANTHROPIC_API_KEY || '' }}
+          GEMINI_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'gemini') && secrets.GEMINI_API_KEY || '' }}
+        shell: bash
+        run: python3 "$RUNNER_TEMP/prw/runtime.py" infer
+      - name: Upload captured comparison and native result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pr-review-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prw/artifact/
+          if-no-files-found: error
+          retention-days: 3
+  publish:
+    needs: [capture, review]
+    if: always() && needs.capture.result == 'success' && needs.capture.outputs.captured == 'true' && needs.review.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download this attempt's result
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pr-review-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prw-artifact/
+      - name: Validate artifact and create a new issue comment
+        env:
+          CAPTURED_JSON: ${{ toJSON(needs.capture.outputs) }}
+          GH_PUBLISH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PRW_PUBLISH_PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import urllib.request
+
+          UPSTREAM = "efdde4afe14aa401a3889012c7f3e9ef3081a430"
+          STATUSES = {"success", "not_run", "key_validation_failed", "inference_failed", "empty_output", "oversized_output", "missing_model_details"}
+
+
+          def require(value, message):
+              if not value:
+                  raise ValueError(message)
+
+
+          def read_file(root, name, limit):
+              path = root / name
+              require(not path.is_symlink() and path.is_file() and path.stat().st_size <= limit, "Invalid artifact file")
+              data = path.read_bytes()
+              require(len(data) <= limit, "Oversized artifact")
+              return data
+
+
+          def expected_identity(event, env):
+              repo = env["GITHUB_REPOSITORY"]
+              require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}", repo)
+                      and repo.split("/")[1] not in {".", ".."}, "Invalid repository")
+              require(env["GITHUB_EVENT_NAME"] in {"pull_request_target", "pull_request"}, "Invalid event")
+              require(event["action"] in {"opened", "reopened", "synchronize", "ready_for_review"}, "Invalid action")
+              pr = event["pull_request"]
+              require(event["repository"]["full_name"] == repo and pr["base"]["repo"]["full_name"] == repo, "Repository mismatch")
+              require(pr["head"]["repo"]["full_name"] == repo and pr["head"]["repo"]["fork"] is False, "Fork excluded")
+              require(pr["draft"] is False and pr["state"] == "open", "Draft or closed PR")
+              require(type(event["number"]) is int and event["number"] > 0 and type(pr["number"]) is int
+                      and pr["number"] == event["number"], "Invalid PR")
+              captured = json.loads(env["CAPTURED_JSON"])
+              require(captured["captured"] == "true", "Missing capture")
+              result = {"schema": 1, "upstream": UPSTREAM, "repository": repo, "pr_number": event["number"],
+                        "base": pr["base"]["sha"], "head": pr["head"]["sha"], "merge_base": captured["merge_base"],
+                        "diff_sha256": captured["diff_sha256"], "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+              for key in ("base", "head", "merge_base"):
+                  require(isinstance(result[key], str) and re.fullmatch(r"[0-9a-f]{40}", result[key]), "Invalid object ID")
+              require(re.fullmatch(r"[0-9a-f]{64}", result["diff_sha256"]), "Invalid diff hash")
+              for key in ("run_id", "run_attempt"):
+                  require(re.fullmatch(r"[1-9][0-9]*", result[key]), "Invalid run identity")
+              return result
+
+
+          def validate(root, expected):
+              require(not root.is_symlink() and root.is_dir(), "Invalid artifact directory")
+              require({p.name for p in root.iterdir()} == {"manifest.json", "review.diff", "review.md"}, "Unexpected artifact files")
+              manifest = json.loads(read_file(root, "manifest.json", 16384))
+              require(type(manifest) is dict and set(manifest) == set(expected) | {"status", "review_sha256"}, "Invalid manifest schema")
+              require(all(manifest[k] == v and type(manifest[k]) is type(v) for k, v in expected.items()), "Artifact identity mismatch")
+              require(manifest["status"] in STATUSES, "Invalid review status")
+              patch = read_file(root, "review.diff", 4 * 1024 * 1024)
+              review = read_file(root, "review.md", 8 * 1024 * 1024)
+              require(hashlib.sha256(patch).hexdigest() == expected["diff_sha256"], "Diff hash mismatch")
+              require(hashlib.sha256(review).hexdigest() == manifest["review_sha256"], "Review hash mismatch")
+              patch.decode("utf-8")
+              text = review.decode("utf-8")
+              require("\x00" not in text, "Invalid Markdown")
+              if manifest["status"] == "success":
+                  require(text.strip() and len(review) <= 60000 and "Agent run details" in text
+                          and re.search(r"^- Model: (xai|openai|anthropic|gemini)/[A-Za-z0-9][A-Za-z0-9._-]*( \(fallback\))?$", text, re.M), "Missing native output or model identity")
+              return manifest, text
+
+
+          def publish(root, expected, client):
+              manifest, native = validate(root, expected)
+              current = client.get_pr(expected["repository"], expected["pr_number"])
+              require(current["base"]["repo"]["full_name"] == expected["repository"] and
+                      current["head"]["repo"]["full_name"] == expected["repository"] and
+                      current["head"]["repo"]["fork"] is False, "Current PR identity changed")
+              require(current["state"] == "open" and current["draft"] is False, "PR is now closed or draft")
+              for side in ("base", "head"):
+                  require(re.fullmatch(r"[0-9a-f]{40}", current[side]["sha"]), "Invalid current object ID")
+              prefix = ("PR-Agent captured comparison\n\n"
+                        f"Repository: `{expected['repository']}`; PR: #{expected['pr_number']}\n"
+                        f"Base: `{expected['base']}`\nHead: `{expected['head']}`\n"
+                        f"Merge base: `{expected['merge_base']}`\nDiff SHA256: `{expected['diff_sha256']}`\n\n")
+              if any(current[k]["sha"] != expected[k] for k in ("base", "head")):
+                  prefix += "The PR advanced after capture. This output describes the captured SHAs above.\n\n"
+              if manifest["status"] == "success":
+                  body = prefix + native
+              else:
+                  body = prefix + "Review did not produce a publishable result. Status: `" + manifest["status"] + "`.\n"
+                  if manifest["status"] in {"oversized_output", "missing_model_details"}:
+                      body += "Native output is retained in this run's artifact without truncation.\n"
+              require(len(body.encode("utf-8")) <= 65000, "Comment too large")
+              # A single new issue comment. No evaluation, old-comment edits, or review events.
+              return client.create_comment(expected["repository"], expected["pr_number"], body)
+
+
+          class GitHubClient:
+              def __init__(self, token):
+                  self.token = token
+
+              def request(self, path, payload=None):
+                  request = urllib.request.Request("https://api.github.com/repos/" + path,
+                                                   data=None if payload is None else json.dumps(payload).encode(),
+                                                   headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
+                                                            "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
+                  # Do not forward authorization through redirects.
+                  class NoRedirect(urllib.request.HTTPRedirectHandler):
+                      def redirect_request(self, *args, **kwargs):
+                          return None
+                  opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+                  with opener.open(request, timeout=30) as response:
+                      data = response.read(2 * 1024 * 1024 + 1)
+                      require(len(data) <= 2 * 1024 * 1024, "API response too large")
+                      return json.loads(data)
+
+              def get_pr(self, repository, number):
+                  return self.request(f"{repository}/pulls/{number}")
+
+              def create_comment(self, repository, number, body):
+                  # No automatic POST retries: a lost response must not create duplicates.
+                  return self.request(f"{repository}/issues/{number}/comments", {"body": body})
+
+
+          if __name__ == "__main__":
+              try:
+                  expected = expected_identity(json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()), os.environ)
+                  publish(Path(os.environ["RUNNER_TEMP"]) / "prw-artifact", expected, GitHubClient(os.environ["GH_PUBLISH_TOKEN"]))
+              except Exception:
+                  print("Publishing failed; artifact validation or comment creation did not complete.", file=sys.stderr)
+                  raise SystemExit(1)
+          PRW_PUBLISH_PY
