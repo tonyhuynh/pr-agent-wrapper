@@ -14,8 +14,19 @@ publisher = load("publish")
 
 
 def inputs(**changes):
+    # Mirrors toJSON(inputs): the caller's model plus every workflow default.
     return {"model": "xai/grok-4.7", "fallback_models": "[]", "extra_instructions": "",
-            "num_max_findings": 3, "ignore_globs": '["vendor/**"]', **changes}
+            "num_max_findings": 3, "ignore_globs": '["vendor/**"]', "api_base": "",
+            "custom_model_max_tokens": 0, "max_model_tokens": 32000, "reasoning_effort": "",
+            "response_language": "en-US", "ai_timeout": 120, "comment_mode": "update", **changes}
+
+
+def chains():
+    """Model chains that together name every provider; one chain holds at most five."""
+    names = sorted(review.KEYS)
+    for start in range(0, len(names), 5):
+        group = names[start:start + 5]
+        yield group, inputs(model=group[0] + "/m", fallback_models=json.dumps([name + "/m" for name in group[1:]]))
 
 
 def event():
@@ -34,6 +45,8 @@ def expected():
 
 
 def artifact(root, text="Native review\n\nAgent run details\n- Model: xai/grok-4.7\n", status="success"):
+    for name in ("manifest.json", "review.diff", "review.md"):
+        (root / name).unlink(missing_ok=True)
     meta = expected()
     data = text.encode()
     manifest = {**meta, "status": status, "review_sha256": hashlib.sha256(data).hexdigest()}

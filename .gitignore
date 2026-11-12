@@ -11,3 +11,4 @@ review.diff
 review.md
 manifest.json
 gitleaks-report.*
+.claude/settings.local.json*

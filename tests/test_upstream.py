@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 from dynaconf import Dynaconf
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
-from support import functions, inputs, review, upstream
+from support import chains, functions, inputs, review, upstream
 
 
 class APIError(Exception): pass
@@ -88,18 +88,22 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertFalse(settings.config.get("use_repo_settings_file"))
 
     def test_key_mapping_real_env_loader(self):
-        config = review.settings(inputs(fallback_models='["openai/a","anthropic/b","gemini/c"]'))
         keys = {public: "test-only-" + provider for provider, (public, _) in review.KEYS.items()}
-        with patch.dict(os.environ, review.provider_keys(config, keys), clear=True):
-            settings = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[], merge_enabled=False)
-            for provider, (public, native) in review.KEYS.items():
-                self.assertEqual(settings.get(native.replace("__", ".")), keys[public])
-            self.assertIsNone(settings.get("OPENAI.API_BASE"))
+        seen = set()
+        for group, chain in chains():
+            with patch.dict(os.environ, review.provider_keys(review.settings(chain), keys), clear=True):
+                settings = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[], merge_enabled=False)
+                for provider, (public, native) in review.KEYS.items():
+                    self.assertEqual(settings.get(native.replace("__", ".")), keys[public] if provider in group else None)
+                self.assertIsNone(settings.get("OPENAI.API_BASE"))
+            seen.update(group)
+        self.assertEqual(seen, set(review.KEYS))
         tree = ast.parse(upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
         provider_paths = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
                               and any(isinstance(t, ast.Name) and t.id == "PROVIDER_SETTING_PATHS" for t in n.targets))
-        for provider in ["xai", "anthropic", "gemini"]:
+        for provider in set(review.KEYS) - {"openai"}:
             self.assertEqual(provider_paths[provider]["api_key"], review.KEYS[provider][1].replace("__", "."))
+        self.assertIn('configured_api_base = settings.get("OPENAI.API_BASE", None)', upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
         self.assertIn('"api_key": settings.get("OPENAI.KEY", None)', upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
 
     def test_wrapped_evaluators_are_rejected_before_dynaconf(self):
@@ -121,6 +125,12 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertIn('get("num_retries", None)', handler)
             else:
                 self.assertIn(field, defaults[section], key)
+        tuned = review.settings(inputs(model="openai/a", api_base="https://llm.example.com/v1", custom_model_max_tokens=128000, reasoning_effort="low"))
+        for key in set(tuned) - set(review.FIXED) - {"ignore.glob", "openai.api_base"}:
+            section, field = key.split(".")
+            self.assertIn(field, defaults[section], key)
+        self.assertIn(defaults["config"]["reasoning_effort"], review.REASONING_EFFORTS)
+        self.assertEqual((defaults["config"]["ai_timeout"], defaults["config"]["max_model_tokens"], defaults["config"]["response_language"]), (120, 32000, "en-US"))
         self.assertEqual(defaults["config"]["model"], "gpt-6.1-sol")
         self.assertEqual(defaults["config"]["fallback_models"], ["gpt-6-luna"])
 

@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Test requirements mirror the pinned PR-Agent lockfile; scripts/bump_upstream.py owns those.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

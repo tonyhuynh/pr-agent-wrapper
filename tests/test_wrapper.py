@@ -1,5 +1,5 @@
 import copy
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from support import ROOT, artifact, event, expected, inputs, publisher, review, source
+from support import ROOT, artifact, chains, event, expected, inputs, publisher, review, source
 
 
 class InputTests(unittest.TestCase):
@@ -24,9 +24,13 @@ class InputTests(unittest.TestCase):
         self.assertEqual(review.settings(inputs(ignore_globs='["generated/**"]'))["ignore.glob"], ["vendor/**", "generated/**"])
 
     def test_invalid_model_and_json_types(self):
-        for value in ["grok-4.7", "openrouter/x/y", "xai/a/b", "xai/a:gateway", "xai/../x", "XAI/model", "xai/a?url=x", "xai/a\n", " xai/a", None]:
-            with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
+        for value in ["grok-4.7", "bedrock/x", "xai/a/b", "xai/a:gateway", "xai/../x", "XAI/model", "xai/a?url=x", "xai/a\n", " xai/a", None, "",
+                      "xai/", "openrouter/", "openrouter/x/../y", "openrouter//y", "openrouter/x/y:", "openrouter/x:a/y", "openrouter/x/y?z", "xai/" + "a" * 129]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
                 review.settings(inputs(model=value))
+        for value in ["openrouter/x-ai/grok-4.6", "openrouter/meta/llama-4:free", "groq/llama-4", "deepseek/deepseek-chat", "mistral/mistral-large-latest", "xai/" + "a" * 128]:
+            with self.subTest(value=value):
+                self.assertEqual(review.settings(inputs(model=value))["config.model"], value)
         for value in ['{}', 'null', 'false', '[3]', '[true]', '[[]]', '[""]', '["openai/a","openai/a"]', '["xai/grok-4.7"]', '["openai/a"]' * 2]:
             with self.subTest(value=value), self.assertRaises((ValueError, TypeError)):
                 review.settings(inputs(fallback_models=value))
@@ -43,9 +47,14 @@ class InputTests(unittest.TestCase):
             self.assertEqual(review.settings(inputs(num_max_findings=value))["pr_reviewer.num_max_findings"], value)
 
     def test_directives_and_bounds(self):
-        for value in ["@jinja {{1+1}}", "@str @format {env[HOME]}", '@json "@jinja {{1}}"', "text @FORMAT x", "@get x", "\x00", "\r", "x" * 8193]:
+        for value in ["@jinja {{1+1}}", "@str @format {env[HOME]}", '@json "@jinja {{1}}"', "text @FORMAT x", "@get x", "\x00", "\r", "x" * 8193,
+                      "@Override first", "  \n@Override after whitespace", "see @read_file /etc/passwd", "a @merge_unique b", "x@json"]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 review.settings(inputs(extra_instructions=value))
+        for value in ["Do not flag a missing @Override.", "Types come from @types/node; ask user@example.com.",
+                      "Ignore @pytest.fixture and @formatter:off markers.", "Use @getter and @internal tags."]:
+            with self.subTest(value=value):
+                self.assertEqual(review.settings(inputs(extra_instructions=value))["pr_reviewer.extra_instructions"], value)
         for value in ['["@str @jinja x"]', '["\\u0040jinja x"]']:
             with self.assertRaises(ValueError):
                 review.settings(inputs(ignore_globs=value))
@@ -54,16 +63,69 @@ class InputTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review.settings({**inputs(), "config.enable_auto_approval": True})
 
+    def test_optional_tuning_inputs(self):
+        config = review.settings(inputs())
+        self.assertEqual((config["config.ai_timeout"], config["config.max_model_tokens"], config["config.response_language"]), (120, 32000, "en-US"))
+        for absent in ["config.custom_model_max_tokens", "config.reasoning_effort", "openai.api_base"]:
+            self.assertNotIn(absent, config)
+        config = review.settings(inputs(model="openai/local-model", api_base="https://llm.example.com:8443/v1", custom_model_max_tokens=128000,
+                                        max_model_tokens=64000, reasoning_effort="high", response_language="pt-BR", ai_timeout=300, comment_mode="new"))
+        self.assertEqual(config["openai.api_base"], "https://llm.example.com:8443/v1")
+        self.assertEqual(review.serialize(config)["OPENAI__API_BASE"], '@json "https://llm.example.com:8443/v1"')
+        self.assertEqual((config["config.custom_model_max_tokens"], config["config.max_model_tokens"], config["config.reasoning_effort"],
+                          config["config.response_language"], config["config.ai_timeout"]), (128000, 64000, "high", "pt-BR", 300))
+        self.assertNotIn("comment_mode", " ".join(config))
+        bad = {"api_base": ["http://llm.example.com/v1", "https://user:pass@llm.example.com", "https://llm.example.com/v1?key=x", "https://llm.example.com/#x",
+                            "file:///etc/passwd", "https://", "https://-bad.example.com", "https://llm.example.com/a b", 7],
+               "custom_model_max_tokens": [-1, 999, 2000001, 1.5, True, "128000", None],
+               "max_model_tokens": [0, 3999, 2000001, True, "32000"],
+               "reasoning_effort": ["extreme", "High", " high", 3, None],
+               "response_language": ["english", "en_US", "en-us", "", None],
+               "ai_timeout": [0, 29, 541, 120.0, True],
+               "comment_mode": ["", "replace", "UPDATE", None]}
+        for name, values in bad.items():
+            for value in values:
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    review.settings(inputs(model="openai/local-model", **{name: value}))
+        # api_base redirects only openai/ models, so it is rejected when none is configured.
+        with self.assertRaises(ValueError):
+            review.settings(inputs(api_base="https://llm.example.com/v1"))
+        review.settings(inputs(fallback_models='["openai/a"]', api_base="https://llm.example.com/v1"))
+
+    def test_input_errors_name_the_input_without_echoing_the_value(self):
+        cases = {"model": "not-a-model-SENTINEL", "fallback_models": '["SENTINEL"', "extra_instructions": "@jinja SENTINEL",
+                 "num_max_findings": 99, "ignore_globs": '{"SENTINEL": 1}', "api_base": "http://SENTINEL", "custom_model_max_tokens": 5,
+                 "max_model_tokens": 1, "reasoning_effort": "SENTINEL", "response_language": "SENTINEL", "ai_timeout": 1, "comment_mode": "SENTINEL"}
+        self.assertEqual(set(cases), review.INPUT_NAMES)
+        for name, value in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                stdout, stderr = io.StringIO(), io.StringIO()
+                environment = {"RUNNER_TEMP": directory, "INPUTS_JSON": json.dumps(inputs(**{name: value}))}
+                with patch.dict(os.environ, environment, clear=True), patch("sys.argv", ["runtime.py", "prepare"]), redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as stopped:
+                        exec(compile(source("review"), "workflow-review-runtime", "exec"), {"__name__": "__main__"})
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertTrue(stdout.getvalue().startswith("::error title=PR-Agent wrapper::Invalid input `" + name + "`: "), stdout.getvalue())
+                self.assertEqual(stdout.getvalue().count("\n"), 1)
+                self.assertNotIn("SENTINEL", stdout.getvalue() + stderr.getvalue())
+
     def test_every_provider_key_required_before_any_call(self):
-        config = review.settings(inputs(fallback_models='["openai/a","anthropic/b","gemini/c"]'))
         keys = {public: "test-value-" + provider for provider, (public, native) in review.KEYS.items()}
+        covered = set()
+        for group, chain in chains():
+            config = review.settings(chain)
+            result = review.provider_keys(config, keys)
+            # Only the providers in this chain get a key, and each of those is required.
+            self.assertEqual(set(result), {review.KEYS[provider][1] for provider in group})
+            covered.update(result)
+            for provider in group:
+                for value in ["", "   "]:
+                    with self.subTest(missing=provider), self.assertRaises(ValueError):
+                        review.provider_keys(config, {**keys, review.KEYS[provider][0]: value})
+        self.assertEqual(covered, {native for _, native in review.KEYS.values()})
+        config = review.settings(inputs(fallback_models='["openai/a","anthropic/b","gemini/c"]'))
         result = review.provider_keys(config, keys)
-        self.assertEqual(set(result), {native for _, native in review.KEYS.values()})
         self.assertEqual(json.loads(result["GOOGLE_AI_STUDIO__GEMINI_API_KEY"][6:]), keys["GEMINI_API_KEY"])
-        for missing in keys:
-            for value in ["", "   "]:
-                with self.subTest(missing=missing), self.assertRaises(ValueError):
-                    review.provider_keys(config, {**keys, missing: value})
         self.assertNotIn("OPENAI__KEY", review.provider_keys(review.settings(inputs()), keys))
         with self.assertRaises(ValueError):
             review.provider_keys(config, {**keys, "XAI_API_KEY": "@jinja x"})
@@ -98,13 +160,22 @@ class InputTests(unittest.TestCase):
             (root / "artifact").mkdir()
             (root / "config.json").write_text(json.dumps(review.settings(inputs(fallback_models='["openai/a"]'))))
             artifact(root / "artifact")
-            stderr = io.StringIO()
-            with patch.dict(os.environ, {"XAI_API_KEY": "stub-key", "RUNNER_TEMP": directory}, clear=True), patch.object(review.subprocess, "run") as run, patch("sys.argv", ["runtime.py", "infer"]), redirect_stderr(stderr):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, {"XAI_API_KEY": "stub-key", "RUNNER_TEMP": directory}, clear=True), patch.object(review.subprocess, "run") as run, patch("sys.argv", ["runtime.py", "infer"]), redirect_stdout(stdout), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as stopped:
                     exec(compile(source("review"), "workflow-review-runtime", "exec"), {"__name__": "__main__"})
                 self.assertEqual(stopped.exception.code, 1)
                 run.assert_not_called()
-            self.assertEqual(stderr.getvalue(), review.SECRET_ERROR_MESSAGES["OPENAI_API_KEY"] + "\nWrapper step failed; no provider details are logged.\n")
+            self.assertEqual(stderr.getvalue(), review.SECRET_ERROR_MESSAGES["OPENAI_API_KEY"] + "\n")
+            self.assertEqual(stdout.getvalue(), "::error title=PR-Agent wrapper::Review failed: key_validation_failed\n")
+
+    def test_unexpected_errors_keep_the_generic_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, {"RUNNER_TEMP": directory, "INPUTS_JSON": "{not json SENTINEL"}, clear=True), patch("sys.argv", ["runtime.py", "prepare"]), redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit):
+                    exec(compile(source("review"), "workflow-review-runtime", "exec"), {"__name__": "__main__"})
+            self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", "Wrapper step failed; no provider details are logged.\n"))
 
     def test_default_primary_only_succeeds_with_only_xai_secret(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -214,7 +285,8 @@ class ProvenanceTests(unittest.TestCase):
                 review.infer(keyed_root)
             expected_meta = publisher.expected_identity(event(), {**environment, "CAPTURED_JSON": json.dumps(outputs)})
             client = PublishTests.Client()
-            publisher.publish(keyed_root / "artifact", expected_meta, client)
+            with redirect_stdout(io.StringIO()):
+                publisher.publish(keyed_root / "artifact", expected_meta, client)
             self.assertEqual(len(client.comments), 1)
             self.assertTrue(client.comments[0][2].endswith(native.decode()))
             self.assertIn(review.digest(b"patch\n"), client.comments[0][2])
@@ -285,14 +357,78 @@ class ProvenanceTests(unittest.TestCase):
 
 class PublishTests(unittest.TestCase):
     class Client:
-        def __init__(self):
+        def __init__(self, existing=()):
             self.current = event()["pull_request"]
             self.comments = []
+            self.updates = []
+            self.existing = list(existing)
+            self.pages = []
         def get_pr(self, repository, number):
             return self.current
+        def list_comments(self, repository, number, page):
+            self.pages.append(page)
+            return self.existing[(page - 1) * 50:page * 50]
         def create_comment(self, repository, number, body):
             self.comments.append((repository, number, body))
             return {"id": 1}
+        def update_comment(self, repository, comment_id, body):
+            self.updates.append((repository, comment_id, body))
+            return {"id": comment_id}
+
+    def setUp(self):
+        # publish() reports through the job summary and stdout; keep test output quiet.
+        self.stdout = io.StringIO()
+        redirect = redirect_stdout(self.stdout)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    @staticmethod
+    def comment(comment_id, body, login="github-actions[bot]", kind="Bot"):
+        return {"id": comment_id, "body": body, "user": {"login": login, "type": kind}}
+
+    def test_update_mode_edits_only_its_own_newest_comment(self):
+        marker = publisher.MARKER
+        others = [self.comment(1, marker + "\nspoofed by a person", "mallory", "User"),
+                  self.comment(2, "quoting " + marker), self.comment(3, marker + "\nold review"),
+                  self.comment(4, marker + "\nother bot", "dependabot[bot]"), self.comment(5, marker + "\nnewer review"),
+                  self.comment(6, marker + "\nnot a bot account", "github-actions[bot]", "User"), self.comment(7, "unrelated")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = artifact(root)
+            client = self.Client(others)
+            publisher.publish(root, meta, client, "update")
+            self.assertEqual((len(client.updates), client.comments), (1, []))
+            self.assertEqual(client.updates[0][:2], ("example/project", 5))
+            self.assertTrue(client.updates[0][2].startswith(marker + "\n"))
+            client = self.Client(others)
+            publisher.publish(root, meta, client, "new")
+            self.assertEqual((client.updates, len(client.comments), client.pages), ([], 1, []))
+            client = self.Client([c for c in others if c["id"] not in {3, 5}])
+            publisher.publish(root, meta, client, "update")
+            self.assertEqual((client.updates, len(client.comments)), ([], 1))
+            # The newest own comment is found past the first page of a long conversation.
+            client = self.Client([self.comment(i, "chatter") for i in range(100, 220)] + [self.comment(999, marker + "\nlate")])
+            publisher.publish(root, meta, client, "update")
+            self.assertEqual((client.updates[0][1], client.pages), (999, [1, 2, 3]))
+            for mode in ["", "replace", None]:
+                client = self.Client(others)
+                with self.assertRaises(ValueError): publisher.publish(root, meta, client, mode)
+                self.assertFalse(client.comments or client.updates)
+
+    def test_update_mode_never_overwrites_a_newer_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = artifact(root)
+            client = self.Client([self.comment(5, publisher.MARKER + "\nreview of the newer head")])
+            client.current["head"]["sha"] = "d" * 40
+            self.assertIsNone(publisher.publish(root, meta, client, "update"))
+            self.assertFalse(client.comments or client.updates)
+            self.assertIn("head advanced", self.stdout.getvalue())
+            # A moved base alone still publishes, with the note.
+            client = self.Client()
+            client.current["base"]["sha"] = "e" * 40
+            publisher.publish(root, meta, client, "update")
+            self.assertIn("PR advanced", client.comments[0][2])
 
     def test_new_comment_with_exact_native_markdown(self):
         native = 'Review `$(anything)`\n<script>never evaluated</script>\n\nAgent run details\n- Model: openai/a (fallback)\n'
@@ -323,7 +459,7 @@ class PublishTests(unittest.TestCase):
             meta = artifact(root)
             client = self.Client()
             client.current["head"]["sha"] = "d" * 40
-            publisher.publish(root, meta, client)
+            publisher.publish(root, meta, client, "new")
             self.assertIn("PR advanced", client.comments[0][2])
             self.assertIn("b" * 40, client.comments[0][2])
 
@@ -380,12 +516,18 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(review.classify(("x" * 60001 + footer).encode(), config), "oversized_output")
         self.assertEqual(review.classify(footer.encode(), config), "success")
         for status in publisher.STATUSES - {"success"}:
-            with tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                meta = artifact(root, "", status)
-                client = self.Client()
-                publisher.publish(root, meta, client)
-                self.assertIn("Status: `" + status + "`", client.comments[0][2])
+            for mode in ["update", "new"]:
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    meta = artifact(root, "", status)
+                    client = self.Client([self.comment(5, publisher.MARKER + "\nlast good review")])
+                    summary = root.parent / (root.name + "-summary")
+                    with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                        self.assertIsNone(publisher.publish(root, meta, client, mode))
+                    # A failed run adds nothing to the PR and keeps the last good review.
+                    self.assertFalse(client.comments or client.updates)
+                    self.assertIn("Status: `" + status + "`", summary.read_text())
+                    summary.unlink()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             meta = artifact(root, "x" * 60001 + footer)
@@ -399,6 +541,22 @@ class PublishTests(unittest.TestCase):
             with patch.object(client, "create_comment", side_effect=OSError("network")) as post:
                 with self.assertRaises(OSError): publisher.publish(root, meta, client)
                 self.assertEqual(post.call_count, 1)
+            client = self.Client([self.comment(5, publisher.MARKER + "\nold")])
+            with patch.object(client, "update_comment", side_effect=OSError("network")) as edit:
+                with self.assertRaises(OSError): publisher.publish(root, meta, client)
+                self.assertEqual(edit.call_count, 1)
+            self.assertFalse(client.comments)
+
+    def test_openrouter_footer_is_publishable(self):
+        native = "Review\n\nAgent run details\n- Model: openrouter/x-ai/grok-4.6:free (fallback)\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = artifact(root, native)
+            client = self.Client()
+            publisher.publish(root, meta, client)
+            self.assertTrue(client.comments[0][2].endswith(native))
+        config = review.settings(inputs(fallback_models='["openrouter/x-ai/grok-4.6:free"]'))
+        self.assertEqual(review.classify(native.encode(), config), "success")
 
 
 class WorkflowTests(unittest.TestCase):
@@ -432,6 +590,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("${{ secrets.", str(publisher_job))
         self.assertNotIn("github.token", str(reviewer))
         self.assertIn("toJSON(needs.capture.outputs)", str(publisher_job))
+        declared = data["on"]["workflow_call"]
+        self.assertEqual(set(declared["inputs"]), review.INPUT_NAMES)
+        self.assertEqual(declared["inputs"]["model"], {"type": "string", "required": "true"})
+        self.assertEqual(set(declared["secrets"]), {public for public, _ in review.KEYS.values()})
+        self.assertEqual(set(publisher.PROVIDERS.split("|")), set(review.KEYS))
+        self.assertEqual(publisher.COMMENT_MODES, review.COMMENT_MODES)
+        # Workflow defaults must pass validation unchanged once a model is supplied.
+        defaults = {name: spec["default"] for name, spec in declared["inputs"].items() if "default" in spec}
+        numbers = {name for name, spec in declared["inputs"].items() if spec["type"] == "number"}
+        review.settings({"model": "xai/grok-4.7", **{k: int(v) if k in numbers else v for k, v in defaults.items()}})
         for value in (source("review"), source("publish")):
             self.assertNotIn("${{", value)
         import check_tree
