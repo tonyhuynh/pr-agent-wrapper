@@ -238,6 +238,25 @@ class InputTests(unittest.TestCase):
             self.assertEqual((root / "artifact/review.md").read_bytes(), b"")
             self.assertEqual(json.loads((root / "artifact/manifest.json").read_text())["status"], "inference_failed")
 
+    def test_failed_review_reports_only_a_fixed_reason(self):
+        upstream_reason, message = next(iter(review.FAILURE_REASONS.items()))
+        known = ("Failed to review PR\n\n**Reason:** " + upstream_reason).encode()
+        for payload, suffix in [(known, ". " + message), (known + b"\n", ". " + message), (b"Failed to review PR", ""),
+                                (b"Failed to review PR\n\n**Reason:** provider said hostile\n::error::x", ""),
+                                (known + b" extra provider text", "")]:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "artifact").mkdir()
+                (root / "output").mkdir()
+                (root / "config.json").write_text(json.dumps(review.settings(inputs())))
+                artifact(root / "artifact")
+                def runner(cmd, **kwargs):
+                    if cmd[1] == "run": (root / "output/review.md").write_bytes(payload)
+                    return subprocess.CompletedProcess(cmd, 1)
+                with patch.dict(os.environ, {"XAI_API_KEY": "stub-key"}, clear=True), patch.object(review.subprocess, "run", side_effect=runner):
+                    with self.assertRaises(review.WrapperError) as raised: review.infer(root)
+                self.assertEqual(str(raised.exception), "Review failed: inference_failed" + suffix)
+
     def test_secret_diagnostic_accepts_only_known_names(self):
         self.assertEqual(set(review.SECRET_ERROR_MESSAGES), {public for public, _ in review.KEYS.values()})
         with self.assertRaises(ValueError):

@@ -161,14 +161,14 @@ Open the failed run. Errors appear as an annotation titled "PR-Agent wrapper", a
 | All three jobs skipped | The PR is a draft, comes from a fork, or the event is not one of the four supported actions | Mark the PR ready for review. Fork PRs are not reviewed |
 | ``Invalid input `name`: ...`` in `capture` | An input broke the rule named in the message. The value is never printed | Fix that input; the [Inputs](#inputs) table has the limits |
 | `Review failed: key_validation_failed` | A provider in your chain has no key, or the caller did not pass it under `secrets:`. The `review` job log names it: `Missing required workflow secret: NAME` | Add the secret to the repository and pass it in the caller |
-| `Review failed: inference_failed` | The provider call failed: wrong model ID, unknown context size, rejected key, rate limit, or timeout | Check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
+| `Review failed: inference_failed` | PR-Agent could not produce a review. When PR-Agent recognizes the cause (rejected key, no credits, rate limit, timeout, context limit, unreachable provider), the message ends with it | Follow the reason. With no reason, check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
 | `Review failed: empty_output` | PR-Agent wrote no review | Rerun. If it repeats, check that `ignore_globs` does not exclude every changed file |
 | `Review failed: oversized_output` | The review is larger than a GitHub comment allows | Lower `num_max_findings`. The full output is in the run's artifact |
 | `Review failed: missing_model_details` | The review lacks the footer that names the model, so its origin cannot be confirmed | Rerun. The output is in the run's artifact |
 | `Ambiguous or missing merge base` in `capture` | The branch history has more than one merge base with the target | Rebase or merge the target branch into the PR |
 | `Diff exceeds 4 MiB` in `capture` | The PR is too large to review | Split the PR. `ignore_globs` applies later and does not lower this size |
 
-`inference_failed` is deliberately vague. Provider error text can contain credentials, so the workflow never logs it.
+The reason after `inference_failed` is one of a few fixed sentences. Provider error text can contain credentials, so the workflow never logs it.
 
 ## How it works
 

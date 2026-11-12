@@ -119,6 +119,14 @@ class ConfigSemanticsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 review.settings(inputs(extra_instructions=payload))
 
+    def test_failure_reasons_match_pinned_source(self):
+        values = {}
+        for node in ast.parse(upstream("pr_agent/tools/pr_reviewer.py")).body:
+            if isinstance(node, ast.Assign) and node.targets[0].id in {"_REVIEW_FAILURE_REASONS", "_UNKNOWN_REVIEW_FAILURE_REASON"}:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+        reasons = {reason for _, reason in values["_REVIEW_FAILURE_REASONS"]} | {values["_UNKNOWN_REVIEW_FAILURE_REASON"]}
+        self.assertEqual(set(review.FAILURE_REASONS), reasons)
+
     def test_all_fixed_keys_exist_in_pinned_source(self):
         defaults = tomllib.loads(upstream("pr_agent/settings/configuration.toml"))
         handler = upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py")

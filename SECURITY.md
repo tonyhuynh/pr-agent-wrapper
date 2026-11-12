@@ -14,7 +14,7 @@ The workflow trusts the caller workflow, wrapper, pinned upstream source, depend
 
 Capture uses a read token to fetch fixed base and head SHAs into a bare repository and make the diff. It runs no PR code, filters, submodules, or LFS processes.
 
-Review has no GitHub token. It builds source without credentials; only the run step receives provider keys. It checks every configured provider's key before starting the container, and only the keys for providers in the configured model chain reach the job. Missing-key errors name the secret without printing its value. Input errors name the input and the rule it broke, in fixed wording that never repeats the value.
+Review has no GitHub token. It builds source without credentials; only the run step receives provider keys. It checks every configured provider's key before starting the container, and only the keys for providers in the configured model chain reach the job. Missing-key errors name the secret without printing its value. Input errors name the input and the rule it broke, in fixed wording that never repeats the value. A failed review may add one of a fixed set of reasons, chosen by exact match against PR-Agent's own fixed failure messages; provider error text is never logged.
 
 The container runs as a nonroot user with a read-only root filesystem, dropped capabilities, resource limits, read-only diff input, and separate writable storage. It receives no host credentials. The workflow suppresses provider output and disables callbacks and telemetry.
 

@@ -109,6 +109,7 @@ jobs:
               "pr_agent/git_providers/plain_diff_provider.py": "40a8f2735de369eab1575ba69e6fe5dd1bb39af0",
               "pr_agent/algo/run_output.py": "b22b60555f6889ea70448a6134458a7d877124bb",
               "pr_agent/algo/run_details.py": "c3ef863b2d571d287fe9bfcabf864b56d1277458",
+              "pr_agent/tools/pr_reviewer.py": "4eeafc993de7f662e7090793ba81739c5e497d90",
               "uv.lock": "5f67de304a16ea51a8532ecf775a166426774195",
           }
           IMAGE = "pr-agent-wrapper:local"
@@ -132,6 +133,25 @@ jobs:
                          "response_language", "ai_timeout", "comment_mode"}
           REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
           COMMENT_MODES = {"update", "new"}
+          # PR-Agent's own fixed failure reasons, each mapped to wording from this file. Nothing else is ever shown.
+          FAILURE_REASONS = {
+              "The model provider rejected the request because the API account has insufficient credits. Add credits, then retry the command.":
+                  "The provider says the account has insufficient credits.",
+              "PR-Agent could not authenticate with the model provider. Check the configured API credentials, then retry.":
+                  "The provider rejected the API key.",
+              "The model provider rate-limited the request. Wait for the limit to reset, then retry.":
+                  "The provider rate-limited the request.",
+              "The model provider timed out before completing the review. Retry the command or adjust the provider timeout.":
+                  "The provider timed out. Retry, or raise `ai_timeout`.",
+              "The pull request exceeded the selected model's context limit. Retry with a larger-context model or an incremental review.":
+                  "The diff exceeds the model's context limit. Lower `max_model_tokens` or pick a larger model.",
+              "PR-Agent could not reach the model provider. Check provider availability and network access, then retry.":
+                  "The runner could not reach the provider.",
+              "Every configured model attempt failed. Check the PR-Agent service logs for the provider error, then retry.":
+                  "Every model in the chain failed without a recognized provider error. Check the model ID.",
+              "PR-Agent encountered an unexpected internal error. Check the PR-Agent service logs for details.":
+                  "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`.",
+          }
           # Dynaconf converter tokens. A value that starts with one is evaluated, not read.
           DIRECTIVES = ("bool|capitalize|casefold|comment|del|empty|float|format|get|insert|int|jinja|json|lower|lstrip|"
                         "merge|merge_unique|none|note|null|read_file|reset|rstrip|split|str|strip|swapcase|title|upper")
@@ -144,6 +164,7 @@ jobs:
               "pr_reviewer.enable_review_labels_security": False,
               "pr_reviewer.enable_review_labels_effort": False,
               "pr_reviewer.enable_large_pr_chunking": False,
+              "pr_reviewer.publish_error_details": True,
               "config.publish_output_progress": False,
               "config.output_run_details": True,
               "config.enable_auto_approval": False,
@@ -478,6 +499,14 @@ jobs:
               return "oversized_output" if len(data) > COMMENT_LIMIT else "success"
 
 
+          def failure_reason(data):
+              # Exact match against PR-Agent's fixed reasons, so provider text can never reach the log.
+              for upstream, message in FAILURE_REASONS.items():
+                  if data.strip() == ("Failed to review PR\n\n**Reason:** " + upstream).encode():
+                      return ". " + message
+              return ""
+
+
           def infer(root):
               config = json.loads((root / "config.json").read_text())
               manifest_path = root / "artifact/manifest.json"
@@ -521,7 +550,7 @@ jobs:
               (root / "artifact/review.md").write_bytes(data)
               meta.update(status=status, review_sha256=digest(data))
               manifest_path.write_text(json.dumps(meta))
-              require(status == "success", "Review failed: " + status)
+              require(status == "success", "Review failed: " + status + (failure_reason(data) if status == "inference_failed" else ""))
 
 
           if __name__ == "__main__":
