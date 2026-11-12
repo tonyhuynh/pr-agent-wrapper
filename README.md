@@ -1,10 +1,10 @@
 # PR-Agent wrapper
 
-A reusable GitHub Actions workflow that reviews pull requests with [PR-Agent](https://github.com/The-PR-Agent/pr-agent) and keeps the LLM key, the GitHub write token, and the PR's code in three separate jobs.
+A reusable GitHub Actions workflow that reviews pull requests with [PR-Agent](https://github.com/The-PR-Agent/pr-agent) and an LLM you choose. It keeps the LLM key, the GitHub write token, and the PR's code in three separate jobs, so no single job can both read your key and write to your repository.
 
-It builds PR-Agent v0.49.0 from pinned source, sends the model the PR diff and nothing else, and posts the review as one PR comment. It never approves, requests changes, labels, merges, or touches anyone else's comments. Do not make it a required check.
+On each push to a PR it sends the diff to the model and writes the review as one PR comment, updated in place. It never approves, requests changes, labels, merges, or touches anyone else's comments.
 
-## Why not run PR-Agent's own action
+## Should you use this or PR-Agent's own action
 
 PR-Agent's action is simpler and does more: it reads the repository, answers comment commands, and can describe or improve a PR. Use it if that is what you want.
 
@@ -14,44 +14,73 @@ This wrapper trades those features for a smaller blast radius:
 - The PR's code is never checked out or run, and PR-Agent ignores configuration files in the repository, so a PR cannot change how it is reviewed.
 - PR-Agent runs from a pinned commit with verified file hashes, in a container with no root, no writable filesystem, and no capabilities.
 
-The cost is context. The model sees the diff with three lines around each change, so it will miss problems that need the rest of the codebase.
+The cost is context. The model sees the diff with three lines around each change, so it will miss problems that need the rest of the codebase. It also skips PRs from forks.
 
-## Use it
+## Set it up
 
-Add this caller workflow and an Actions secret for your provider. Replace `<MAIN_SHA>` with a full commit SHA of this repository. The YAML matches [examples/caller.yml](examples/caller.yml).
+1. **Add your provider's API key as an Actions secret** in the repository that will be reviewed (Settings, then Secrets and variables, then Actions). The secret name depends on the provider; see [Models and providers](#models-and-providers). For xAI:
 
-```yaml
-name: PR-Agent review
-on:
-  pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
-permissions:
-  contents: read
-concurrency:
-  group: pr-agent-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-jobs:
-  review:
-    permissions:
-      contents: read
-      pull-requests: write
-    uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
-    with:
-      model: xai/grok-4.7
-      extra_instructions: Focus on the workflow, package.json and docs.
-    secrets:
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-```
+   ```sh
+   gh secret set XAI_API_KEY
+   ```
 
-The caller job needs `pull-requests: write`. Pass only the secrets your models need; never use `secrets: inherit`. The `concurrency` block cancels a running review when a new push arrives, so you pay for one review per burst of pushes.
+2. **Pick a commit of this repository to pin.** Callers pin a full commit SHA, not a branch, so the workflow cannot change under you:
 
-The workflow accepts `pull_request_target` and `pull_request` events for opened, reopened, synchronize, and ready-for-review actions. It skips forks, drafts, closed PRs, and comment commands.
+   ```sh
+   gh api repos/tonyhuynh/pr-agent-wrapper/commits/main --jq .sha
+   ```
+
+3. **Add `.github/workflows/pr-agent-review.yml`** to your repository with the SHA in place of `<MAIN_SHA>`. This is [examples/caller.yml](examples/caller.yml):
+
+   ```yaml
+   name: PR-Agent review
+   on:
+     pull_request_target:
+       types: [opened, reopened, synchronize, ready_for_review]
+   permissions:
+     contents: read
+   concurrency:
+     group: pr-agent-review-${{ github.event.pull_request.number }}
+     cancel-in-progress: true
+   jobs:
+     review:
+       permissions:
+         contents: read
+         pull-requests: write
+       uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
+       with:
+         model: xai/grok-4.7
+         extra_instructions: Focus on the workflow, package.json and docs.
+       secrets:
+         XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+   ```
+
+4. **Merge that file to your default branch, then open a PR.** Three jobs run: `capture`, `review`, and `publish`. When they finish, a comment from `github-actions[bot]` appears on the PR. Later pushes update the same comment.
+
+What the pieces of the caller do:
+
+- `pull-requests: write` lets the `publish` job write the comment. Nothing else gets that permission.
+- `secrets:` passes only the keys your models need. Do not use `secrets: inherit`.
+- `concurrency` cancels a running review when a new push arrives, so you pay for one review per burst of pushes.
+
+Do not make the review a required check. A provider outage would then block every merge.
+
+### Which trigger
+
+The workflow accepts both PR triggers. It runs on opened, reopened, synchronize, and ready-for-review, and skips drafts, forks, and closed PRs under either one.
+
+| Trigger | Caller file is read from | Choose it when |
+| --- | --- | --- |
+| `pull_request_target` | Your default branch | You want the review settings fixed by the default branch, so a PR cannot edit its own reviewer. This is the recommended setup. |
+| `pull_request` | The PR's own branch | You want to try the workflow in the PR that adds it, before anything is merged. |
+
+Under `pull_request`, GitHub withholds secrets from Dependabot PRs, so those runs fail with a missing-key error.
 
 ## Models and providers
 
-`model` is required and has the form `<provider>/<model>`. There is no default, because a default model goes stale and then breaks every caller pinned to it.
+`model` is required and has the form `<provider>/<model>`, where the model part is the provider's own model ID. There is no default, because a default model goes stale and then breaks every caller pinned to it.
 
-| Provider prefix | Workflow secret | Example |
+| Provider prefix | Secret to pass | Example |
 | --- | --- | --- |
 | `xai/` | `XAI_API_KEY` | `xai/grok-4.7` |
 | `openai/` | `OPENAI_API_KEY` | `openai/gpt-6.1-sol` |
@@ -62,56 +91,114 @@ The workflow accepts `pull_request_target` and `pull_request` events for opened,
 | `deepseek/` | `DEEPSEEK_API_KEY` | `deepseek/<model>` |
 | `mistral/` | `MISTRAL_API_KEY` | `mistral/<model>` |
 
-The names after the prefix are the provider's own model IDs. Every provider in your chain needs its key. A missing key fails before the container starts, with a message naming the secret.
-
-Any other OpenAI-compatible service, including a self-hosted one, works through `api_base`: set `model: openai/<its-model-name>`, `api_base: https://your-endpoint/v1`, and put its key in `OPENAI_API_KEY`. PR-Agent has to know the model's context size. If the pinned version does not, the review fails, and you fix it by setting `custom_model_max_tokens`. The same applies to a model released after the pinned PR-Agent version.
-
 Bedrock, Vertex AI, and Azure are not supported yet. They need more than one credential each.
 
-`fallback_models` is a JSON array of up to four more models, tried in order when the one before fails with an error PR-Agent treats as retryable. The review footer names the model that answered.
+### Fallback models
+
+`fallback_models` lists up to four more models, tried in order when the one before fails with an error PR-Agent treats as retryable. It is a JSON array written as a string, and every provider in the chain needs its secret:
+
+```yaml
+    with:
+      model: anthropic/claude-sonnet-5-5
+      fallback_models: '["openai/gpt-6.1-sol"]'
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+```
+
+The footer of the review names the model that answered and says when it was a fallback.
+
+### Other OpenAI-compatible services
+
+Any service that speaks the OpenAI API, including one you host, works through `api_base`. Use the `openai/` prefix and put the service's key in `OPENAI_API_KEY`:
+
+```yaml
+    with:
+      model: openai/my-model
+      api_base: https://llm.example.com/v1
+      custom_model_max_tokens: 128000
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.MY_LLM_KEY }}
+```
+
+`custom_model_max_tokens` tells PR-Agent the model's context size. You need it whenever the pinned PR-Agent does not know the model, which includes models released after the pinned version. Without it, the review fails with `inference_failed`.
 
 ## Inputs
 
-| Input | Default | Limits |
+Only `model` is required.
+
+| Input | Default | What it does and its limits |
 | --- | --- | --- |
-| `model` | Required | See above |
-| `fallback_models` | `'[]'` | JSON array string; up to 4 models, no duplicates or repeated primary |
-| `extra_instructions` | Empty | Up to 8 KiB of text, added to the review prompt |
-| `num_max_findings` | `3` | Integer from 1 to 10 |
-| `ignore_globs` | `'["vendor/**"]'` | JSON array string; up to 32 patterns, 256 bytes each. `vendor/**` always stays excluded |
+| `model` | Required | The model to use, as `<provider>/<model>` |
+| `fallback_models` | `'[]'` | JSON array string of up to 4 more models; no duplicates, and not the primary |
+| `extra_instructions` | Empty | Text added to the review prompt, up to 8 KiB |
+| `num_max_findings` | `3` | Most findings to report, 1 to 10 |
+| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded |
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
-| `api_base` | Empty | HTTPS URL for an OpenAI-compatible endpoint. Needs an `openai/` model |
-| `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know; 1000 to 2000000, or 0 to leave unset |
-| `max_model_tokens` | `32000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000 |
+| `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR` |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
-| `response_language` | `en-US` | A locale such as `pt-BR` |
-| `ai_timeout` | `120` | Seconds per model call, 30 to 540 |
+| `max_model_tokens` | `32000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000 |
+| `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
+| `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint. Needs an `openai/` model |
+| `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know, 1000 to 2000000; 0 leaves it unset |
 
 Text inputs cannot start with an at sign or contain a Dynaconf directive such as `@json` or `@format`, because PR-Agent's settings loader would evaluate it. Mentions like `@Override` or `@types/node` inside a sentence are fine.
 
-An invalid input fails the `capture` job with an annotation that names the input and the rule it broke. The message never repeats the value.
+## What to expect on a PR
 
-## How it runs
+- **One comment.** It starts with the repository, PR number, base SHA, head SHA, and a hash of the diff that was reviewed, followed by PR-Agent's review. In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. In `new` mode every run, including a rerun, adds a comment.
+- **Pushes during a review.** If the PR moved while a review was running, the comment says so and still names the commits it covers. If a newer run already reviewed the newer head, the older run writes nothing.
+- **Failures stay off the PR.** A failed review fails the job and writes the reason to the job summary. The last good review stays in place.
+- **Each run builds PR-Agent from source**, so the build adds to every run's time.
+- **Your provider sees the diff.** The diff and review are also kept as workflow artifacts for 3 days. See [SECURITY.md](SECURITY.md) before using this on code that must not leave the repository.
 
-- `capture` uses a read token to fetch the event's base and head commits into a bare repository and make the diff. It runs no PR code.
-- `review` builds the pinned source without credentials, then runs PR-Agent in the locked-down container. Only the run step receives provider keys. The job has no GitHub token.
-- `publish` uses a write token and no provider keys. It validates the result, rechecks the PR, and writes one comment stamped with the captured base SHA, head SHA, and diff hash.
+## When something goes wrong
 
-In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. If the PR head moved after capture and the comment already covers the newer head, it writes nothing. Otherwise it publishes with a note that the PR advanced. In `new` mode every run adds a comment, and a rerun adds another.
+Open the failed run. Errors appear as an annotation titled "PR-Agent wrapper", and the `publish` job's summary repeats the review status.
 
-When a review fails, the job fails and the reason goes to the job summary. Nothing is posted and the last good review stays in place. The statuses are `key_validation_failed`, `inference_failed`, `empty_output`, `oversized_output`, and `missing_model_details`. Provider error text is never logged, since it can contain credentials, so `inference_failed` covers a wrong model name, an unknown context size, a rejected key, and a timeout alike. The workflow withholds any output that contains a provider key.
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| All three jobs skipped | The PR is a draft, comes from a fork, or the event is not one of the four supported actions | Mark the PR ready for review. Fork PRs are not reviewed |
+| ``Invalid input `name`: ...`` in `capture` | An input broke the rule named in the message. The value is never printed | Fix that input; the [Inputs](#inputs) table has the limits |
+| `Review failed: key_validation_failed` | A provider in your chain has no key, or the caller did not pass it under `secrets:`. The `review` job log names it: `Missing required workflow secret: NAME` | Add the secret to the repository and pass it in the caller |
+| `Review failed: inference_failed` | The provider call failed: wrong model ID, unknown context size, rejected key, rate limit, or timeout | Check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
+| `Review failed: empty_output` | PR-Agent wrote no review | Rerun. If it repeats, check that `ignore_globs` does not exclude every changed file |
+| `Review failed: oversized_output` | The review is larger than a GitHub comment allows | Lower `num_max_findings`. The full output is in the run's artifact |
+| `Review failed: missing_model_details` | The review lacks the footer that names the model, so its origin cannot be confirmed | Rerun. The output is in the run's artifact |
+| `Ambiguous or missing merge base` in `capture` | The branch history has more than one merge base with the target | Rebase or merge the target branch into the PR |
+| `Diff exceeds 4 MiB` in `capture` | The PR is too large to review | Split the PR. `ignore_globs` applies later and does not lower this size |
 
-Each run builds the PR-Agent image from source, so the build adds to every run's time.
+`inference_failed` is deliberately vague. Provider error text can contain credentials, so the workflow never logs it.
 
-## Updating
+## How it works
 
-The review job builds PR-Agent v0.49.0 from commit `efdde4afe14aa401a3889012c7f3e9ef3081a430`. To move it, run `python scripts/bump_upstream.py v0.50.0`, read the upstream diff it links, and run the checks below. Dependabot proposes updates to the pinned actions.
+Each job gets only what it needs:
 
-Callers choose when to take a change by moving their SHA; [CHANGELOG.md](CHANGELOG.md) lists what each move brings. To roll back, point the caller at an earlier SHA or remove the job. See [SECURITY.md](SECURITY.md) for risks and reporting.
+| Job | Has | Does |
+| --- | --- | --- |
+| `capture` | Read-only GitHub token | Fetches the event's base and head commits into a bare repository, makes the diff, validates inputs. Runs no PR code |
+| `review` | Provider keys, no GitHub token | Builds PR-Agent from the pinned commit without credentials, then runs it on the diff in a container with no root, a read-only filesystem, and no capabilities |
+| `publish` | Write token, no provider keys | Validates the result against the captured hashes, rechecks the PR, and writes the comment |
 
-## Local checks
+The Python that does this is embedded in [.github/workflows/review.yml](.github/workflows/review.yml), because a reusable workflow cannot read other files from its own repository without a checkout. The tests extract and run that same code.
 
-Run the same checks as [.github/workflows/test.yml](.github/workflows/test.yml), without provider keys:
+[SECURITY.md](SECURITY.md) lists what this design does not protect against.
+
+## Updating and rolling back
+
+You take a change only by moving the SHA in your caller. [CHANGELOG.md](CHANGELOG.md) lists what each change brings, with breaking changes first. To roll back, point the caller at an earlier SHA or delete the job.
+
+## Developing this repository
+
+| Path | What it holds |
+| --- | --- |
+| `.github/workflows/review.yml` | The reusable workflow and its two embedded Python programs |
+| `.github/workflows/test.yml` | CI: lint, secret scans, and tests, all without provider keys |
+| `examples/caller.yml` | The caller shown above |
+| `scripts/` | Loader for the embedded Python, tree and secret checks, upstream fetch and repin |
+| `tests/` | Wrapper tests, and tests that run pinned PR-Agent code with stubbed providers |
+
+The checks need Python 3.11 or newer and Go (for `actionlint` and `gitleaks`). They mirror [.github/workflows/test.yml](.github/workflows/test.yml):
 
 ```sh
 python3 -m venv .venv
@@ -127,6 +214,10 @@ go install github.com/zricethezav/gitleaks/v8@v8.24.3
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The fetch script verifies pinned source files. For offline tests, supply those files in a fixture directory and set `PRW_UPSTREAM_DIR`, for example `PRW_UPSTREAM_DIR=.test-upstream .venv/bin/python -m unittest discover -s tests -v`. Tests cover wrapper behavior and stubbed upstream calls. They do not cover live provider calls or real GitHub publishing.
+`fetch_upstream.py` downloads a dozen pinned PR-Agent source files into `.test-upstream/` and verifies their hashes; the tests need them. To use files you already have, set `PRW_UPSTREAM_DIR` to their directory. The tests do not call a provider or publish to GitHub.
 
-This wrapper uses the [MIT license](LICENSE); dependencies retain their own licenses.
+The review job builds PR-Agent v0.49.0 from commit `efdde4afe14aa401a3889012c7f3e9ef3081a430`. To move the pin, run `.venv/bin/python scripts/bump_upstream.py v0.50.0`, read the upstream diff it links, delete `.test-upstream/`, and run the checks again. Dependabot proposes updates to the pinned actions.
+
+## License
+
+[MIT](LICENSE). PR-Agent and its dependencies keep their own licenses.

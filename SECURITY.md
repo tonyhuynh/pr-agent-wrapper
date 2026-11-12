@@ -1,5 +1,13 @@
 # Security policy
 
+## Reporting a vulnerability
+
+Use GitHub's private vulnerability reporting on this repository (Security tab, then Report a vulnerability). Never put credentials or private source in a public issue.
+
+If you suspect a key leaked: disable the caller workflow, revoke the affected provider keys, check who could read the run's artifacts and comments, then report privately.
+
+## What the workflow trusts
+
 The workflow trusts the caller workflow, wrapper, pinned upstream source, dependencies, GitHub runner, and Docker. Maintainers who can change workflows can affect secret handling. Fork and draft checks cannot stop a malicious trusted maintainer or compromised dependency.
 
 ## Secret handling
@@ -19,5 +27,3 @@ There is no network egress allowlist. Malicious dependencies or a compromised ru
 Providers receive the diff and instructions under their own data policies. With `api_base`, the diff and `OPENAI_API_KEY` go to the URL the caller workflow names, so treat that input like a secret destination and never set it from PR-controlled data. Artifacts retain the diff and output for 3 days. People with artifact access can read them. Do not send material that must stay within the repository.
 
 Prompt injection remains possible. Check model findings, links, and Markdown before acting. Ignored files, binary patches, missing context, and token limits reduce coverage. PR state can change after the publisher's final check. In `new` mode, reruns add duplicate comments.
-
-Report vulnerabilities through GitHub's private vulnerability reporting feature when available. Never put credentials or private source in public issues. For a suspected leak, stop the caller workflow, revoke affected provider keys, inspect artifact and comment access, and report privately.
