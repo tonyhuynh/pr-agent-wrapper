@@ -177,7 +177,7 @@ class InputTests(unittest.TestCase):
                     exec(compile(source("review"), "workflow-review-runtime", "exec"), {"__name__": "__main__"})
             self.assertEqual((stdout.getvalue(), stderr.getvalue()), ("", "Wrapper step failed; no provider details are logged.\n"))
 
-    def test_default_primary_only_succeeds_with_only_xai_secret(self):
+    def test_primary_only_chain_succeeds_with_only_its_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "artifact").mkdir()
@@ -188,8 +188,10 @@ class InputTests(unittest.TestCase):
             artifact(root / "artifact")
             native_markdown = b"Native review\nAgent run details\n- Model: xai/grok-4.7\n"
             starts = []
+            run_timeouts = []
             def runner(cmd, **kwargs):
                 if cmd[1] == "run":
+                    run_timeouts.append(kwargs["timeout"])
                     starts.append(cmd)
                     self.assertEqual({name for name in kwargs["env"] if name in {key for _, key in review.KEYS.values()}}, {"XAI__KEY"})
                     self.assertEqual(json.loads(kwargs["env"]["CONFIG__FALLBACK_MODELS"][6:]), [])
@@ -199,10 +201,27 @@ class InputTests(unittest.TestCase):
             stderr = io.StringIO()
             with patch.dict(os.environ, {"XAI_API_KEY": "stub-key"}, clear=True), patch.object(review.subprocess, "run", side_effect=runner), redirect_stderr(stderr):
                 review.infer(root)
+            self.assertEqual(run_timeouts, [600])
             self.assertEqual(len(starts), 1)
             self.assertEqual(stderr.getvalue(), "")
             self.assertEqual((root / "artifact/review.md").read_bytes(), native_markdown)
             self.assertEqual(json.loads((root / "artifact/manifest.json").read_text())["status"], "success")
+
+    def test_container_timeout_covers_the_whole_chain(self):
+        for changes, expected_limit in [({"ai_timeout": 540}, 600), ({"ai_timeout": 540, "fallback_models": '["openai/a"]'}, 1140),
+                                        ({"ai_timeout": 540, "fallback_models": '["openai/a","openai/b","openai/c"]'}, 1500)]:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "artifact").mkdir()
+                (root / "config.json").write_text(json.dumps(review.settings(inputs(**changes))))
+                artifact(root / "artifact")
+                limits = []
+                def runner(cmd, **kwargs):
+                    if cmd[1] == "run": limits.append(kwargs["timeout"])
+                    return subprocess.CompletedProcess(cmd, 1)
+                with patch.dict(os.environ, {"XAI_API_KEY": "stub-key", "OPENAI_API_KEY": "stub-key-2"}, clear=True), patch.object(review.subprocess, "run", side_effect=runner), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(ValueError): review.infer(root)
+                self.assertEqual(limits, [expected_limit])
 
     def test_unknown_errors_and_response_details_stay_out_of_logs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -367,7 +386,7 @@ class PublishTests(unittest.TestCase):
             return self.current
         def list_comments(self, repository, number, page):
             self.pages.append(page)
-            return self.existing[(page - 1) * 50:page * 50]
+            return self.existing[(page - 1) * 20:page * 20]
         def create_comment(self, repository, number, body):
             self.comments.append((repository, number, body))
             return {"id": 1}
@@ -409,7 +428,7 @@ class PublishTests(unittest.TestCase):
             # The newest own comment is found past the first page of a long conversation.
             client = self.Client([self.comment(i, "chatter") for i in range(100, 220)] + [self.comment(999, marker + "\nlate")])
             publisher.publish(root, meta, client, "update")
-            self.assertEqual((client.updates[0][1], client.pages), (999, [1, 2, 3]))
+            self.assertEqual((client.updates[0][1], client.pages), (999, [1, 2, 3, 4, 5, 6, 7]))
             for mode in ["", "replace", None]:
                 client = self.Client(others)
                 with self.assertRaises(ValueError): publisher.publish(root, meta, client, mode)
@@ -419,11 +438,17 @@ class PublishTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             meta = artifact(root)
-            client = self.Client([self.comment(5, publisher.MARKER + "\nreview of the newer head")])
+            client = self.Client([self.comment(5, publisher.MARKER + "\nHead: `" + "d" * 40 + "`\nreview of the newer head")])
             client.current["head"]["sha"] = "d" * 40
             self.assertIsNone(publisher.publish(root, meta, client, "update"))
             self.assertFalse(client.comments or client.updates)
-            self.assertIn("head advanced", self.stdout.getvalue())
+            self.assertIn("newer head", self.stdout.getvalue())
+            # No run reviewed the newer head (a bot push triggers none), so this review still lands, with the note.
+            client = self.Client([self.comment(5, publisher.MARKER + "\nHead: `" + "f" * 40 + "`\nolder review")])
+            client.current["head"]["sha"] = "d" * 40
+            publisher.publish(root, meta, client, "update")
+            self.assertEqual((client.updates[0][1], client.comments), (5, []))
+            self.assertIn("PR advanced", client.updates[0][2])
             # A moved base alone still publishes, with the note.
             client = self.Client()
             client.current["base"]["sha"] = "e" * 40

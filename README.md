@@ -97,7 +97,7 @@ An invalid input fails the `capture` job with an annotation that names the input
 - `review` builds the pinned source without credentials, then runs PR-Agent in the locked-down container. Only the run step receives provider keys. The job has no GitHub token.
 - `publish` uses a write token and no provider keys. It validates the result, rechecks the PR, and writes one comment stamped with the captured base SHA, head SHA, and diff hash.
 
-In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. If the PR head moved after capture, it writes nothing and leaves the comment to the newer run. In `new` mode every run adds a comment, and a rerun adds another.
+In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. If the PR head moved after capture and the comment already covers the newer head, it writes nothing. Otherwise it publishes with a note that the PR advanced. In `new` mode every run adds a comment, and a rerun adds another.
 
 When a review fails, the job fails and the reason goes to the job summary. Nothing is posted and the last good review stays in place. The statuses are `key_validation_failed`, `inference_failed`, `empty_output`, `oversized_output`, and `missing_model_details`. Provider error text is never logged, since it can contain credentials, so `inference_failed` covers a wrong model name, an unknown context size, a rejected key, and a timeout alike. The workflow withholds any output that contains a provider key.
 

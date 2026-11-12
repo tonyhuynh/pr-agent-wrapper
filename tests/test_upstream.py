@@ -77,8 +77,11 @@ def config_scope(config):
 
 class ConfigSemanticsTests(unittest.TestCase):
     def test_real_pinned_loader_replaces_primary_and_fallback_defaults(self):
-        for fallbacks in [[], ["openai/a", "anthropic/b", "gemini/c"]]:
-            config = review.settings(inputs(fallback_models=json.dumps(fallbacks), extra_instructions='Check "package.json"\nthen docs.'))
+        tuned = {"api_base": "https://llm.example.com/v1", "custom_model_max_tokens": 128000, "max_model_tokens": 64000,
+                 "reasoning_effort": "high", "response_language": "pt-BR", "ai_timeout": 300}
+        for fallbacks, extra in [([], {}), (["openai/a", "anthropic/b", "gemini/c"], {}), (["openai/a", "openrouter/x-ai/grok-4.6:free"], tuned)]:
+            config = review.settings(inputs(fallback_models=json.dumps(fallbacks), extra_instructions='Check "package.json"\nthen docs; skip @Override and a@b.co.', **extra))
+            self.assertEqual("openai.api_base" in config, bool(extra))
             with config_scope(config) as settings:
                 for key, value in config.items():
                     self.assertEqual(settings.get(key), value, key)

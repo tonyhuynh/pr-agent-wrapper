@@ -496,7 +496,10 @@ jobs:
                   # Explicit literal HOME avoids inheriting the Docker client's home path.
                   cmd[cmd.index("HOME")] = "HOME=/tmp"
                   try:
-                      completed = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+                      # Leave every model in the chain its full ai_timeout before the container is stopped.
+                      attempts = 1 + len(config["config.fallback_models"])
+                      limit = min(1500, max(600, config["config.ai_timeout"] * attempts + 60))
+                      completed = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=limit)
                   finally:
                       subprocess.run(["docker", "rm", "--force", "pr-agent-wrapper-review"], env=clean_env(root),
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
@@ -692,17 +695,17 @@ jobs:
 
 
           def own_comment(client, repository, number):
-              """Return the id of this workflow's newest comment on the PR, or None."""
+              """Return (id, body) of this workflow's newest comment on the PR, or None."""
               found = None
-              for page in range(1, 21):
+              for page in range(1, 51):
                   comments = client.list_comments(repository, number, page)
                   require(type(comments) is list, "Unexpected comment listing")
                   for item in comments:
                       user = item.get("user") or {}
                       if (user.get("login") == BOT and user.get("type") == "Bot" and isinstance(item.get("body"), str)
                               and item["body"].startswith(MARKER) and type(item.get("id")) is int and item["id"] > 0):
-                          found = item["id"]
-                  if len(comments) < 50:
+                          found = (item["id"], item["body"])
+                  if len(comments) < 20:
                       break
               return found
 
@@ -725,9 +728,10 @@ jobs:
               for side in ("base", "head"):
                   require(re.fullmatch(r"[0-9a-f]{40}", current[side]["sha"]), "Invalid current object ID")
               advanced = any(current[k]["sha"] != expected[k] for k in ("base", "head"))
-              if mode == "update" and current["head"]["sha"] != expected["head"]:
-                  # The newer push has its own run. Do not overwrite its comment with an older review.
-                  summary("PR-Agent review skipped: the PR head advanced after capture, so a newer run owns the comment.")
+              existing = own_comment(client, expected["repository"], expected["pr_number"]) if mode == "update" else None
+              if existing and current["head"]["sha"] != expected["head"] and ("Head: `" + current["head"]["sha"] + "`") in existing[1]:
+                  # A newer run already reviewed the current head. Do not overwrite it with an older review.
+                  summary("PR-Agent review skipped: the comment already covers a newer head than this run captured.")
                   return None
               prefix = (MARKER + "\nPR-Agent captured comparison\n\n"
                         f"Repository: `{expected['repository']}`; PR: #{expected['pr_number']}\n"
@@ -738,12 +742,11 @@ jobs:
               body = prefix + native
               require(len(body.encode("utf-8")) <= 65000, "Comment too large")
               # One comment per call. No evaluation, review events, labels, or edits to other authors' comments.
-              existing = own_comment(client, expected["repository"], expected["pr_number"]) if mode == "update" else None
               if existing is None:
                   result = client.create_comment(expected["repository"], expected["pr_number"], body)
                   summary("PR-Agent review posted as a new comment.")
               else:
-                  result = client.update_comment(expected["repository"], existing, body)
+                  result = client.update_comment(expected["repository"], existing[0], body)
                   summary("PR-Agent review updated the existing comment.")
               return result
 
@@ -771,8 +774,8 @@ jobs:
                   return self.request(f"{repository}/pulls/{number}")
 
               def list_comments(self, repository, number, page):
-                  # 50 comments of up to 64 KiB each fit in the raised limit.
-                  return self.request(f"{repository}/issues/{number}/comments?per_page=50&page={page}", limit=8 * 1024 * 1024)
+                  # 20 comments at GitHub's size limit, in the widest encoding, fit in the raised limit.
+                  return self.request(f"{repository}/issues/{number}/comments?per_page=20&page={page}", limit=8 * 1024 * 1024)
 
               def create_comment(self, repository, number, body):
                   # No automatic POST retries: a lost response must not create duplicates.
