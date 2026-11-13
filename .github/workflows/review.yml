@@ -4,7 +4,7 @@ on:
     inputs:
       model:
         type: string
-        default: xai/grok-4.7
+        required: true
       fallback_models:
         type: string
         default: '[]'
@@ -17,6 +17,30 @@ on:
       ignore_globs:
         type: string
         default: '["vendor/**"]'
+      api_base:
+        type: string
+        default: ''
+      custom_model_max_tokens:
+        type: number
+        default: 0
+      max_model_tokens:
+        type: number
+        default: 64000
+      reasoning_effort:
+        type: string
+        default: ''
+      response_language:
+        type: string
+        default: en-US
+      ai_timeout:
+        type: number
+        default: 120
+      comment_mode:
+        type: string
+        default: update
+      large_pr_chunking:
+        type: boolean
+        default: false
     secrets:
       XAI_API_KEY:
         required: false
@@ -25,6 +49,14 @@ on:
       ANTHROPIC_API_KEY:
         required: false
       GEMINI_API_KEY:
+        required: false
+      OPENROUTER_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+      DEEPSEEK_API_KEY:
+        required: false
+      MISTRAL_API_KEY:
         required: false
 permissions:
   contents: read
@@ -80,6 +112,7 @@ jobs:
               "pr_agent/git_providers/plain_diff_provider.py": "40a8f2735de369eab1575ba69e6fe5dd1bb39af0",
               "pr_agent/algo/run_output.py": "b22b60555f6889ea70448a6134458a7d877124bb",
               "pr_agent/algo/run_details.py": "c3ef863b2d571d287fe9bfcabf864b56d1277458",
+              "pr_agent/tools/pr_reviewer.py": "4eeafc993de7f662e7090793ba81739c5e497d90",
               "uv.lock": "5f67de304a16ea51a8532ecf775a166426774195",
           }
           IMAGE = "pr-agent-wrapper:local"
@@ -91,7 +124,42 @@ jobs:
               "openai": ("OPENAI_API_KEY", "OPENAI__KEY"),
               "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC__KEY"),
               "gemini": ("GEMINI_API_KEY", "GOOGLE_AI_STUDIO__GEMINI_API_KEY"),
+              "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER__KEY"),
+              "groq": ("GROQ_API_KEY", "GROQ__KEY"),
+              "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK__KEY"),
+              "mistral": ("MISTRAL_API_KEY", "MISTRAL__KEY"),
           }
+          # OpenRouter and Groq address models as vendor/model[:variant]; the other providers do not.
+          NESTED_MODEL_PROVIDERS = {"openrouter", "groq"}
+          INPUT_NAMES = {"model", "fallback_models", "extra_instructions", "num_max_findings", "ignore_globs",
+                         "api_base", "custom_model_max_tokens", "max_model_tokens", "reasoning_effort",
+                         "response_language", "ai_timeout", "comment_mode", "large_pr_chunking"}
+          REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+          COMMENT_MODES = {"update", "new"}
+          # Model calls PR-Agent may make for one review when large_pr_chunking is on.
+          CHUNK_CALLS = 3
+          # PR-Agent's own fixed failure reasons, each mapped to wording from this file. Nothing else is ever shown.
+          FAILURE_REASONS = {
+              "The model provider rejected the request because the API account has insufficient credits. Add credits, then retry the command.":
+                  "The provider says the account has insufficient credits.",
+              "PR-Agent could not authenticate with the model provider. Check the configured API credentials, then retry.":
+                  "The provider rejected the API key.",
+              "The model provider rate-limited the request. Wait for the limit to reset, then retry.":
+                  "The provider rate-limited the request.",
+              "The model provider timed out before completing the review. Retry the command or adjust the provider timeout.":
+                  "The provider timed out. Retry, or raise `ai_timeout`.",
+              "The pull request exceeded the selected model's context limit. Retry with a larger-context model or an incremental review.":
+                  "The diff exceeds the model's context limit. Lower `max_model_tokens` or pick a larger model.",
+              "PR-Agent could not reach the model provider. Check provider availability and network access, then retry.":
+                  "The runner could not reach the provider.",
+              "Every configured model attempt failed. Check the PR-Agent service logs for the provider error, then retry.":
+                  "Every model in the chain failed. Check the model ID and the API key.",
+              "PR-Agent encountered an unexpected internal error. Check the PR-Agent service logs for details.":
+                  "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`.",
+          }
+          # Dynaconf converter tokens. A value that starts with one is evaluated, not read.
+          DIRECTIVES = ("bool|capitalize|casefold|comment|del|empty|float|format|get|insert|int|jinja|json|lower|lstrip|"
+                        "merge|merge_unique|none|note|null|read_file|reset|rstrip|split|str|strip|swapcase|title|upper")
           FIXED = {
               "pr_reviewer.persistent_comment": False,
               "pr_reviewer.persistent_finding_state": False,
@@ -100,12 +168,12 @@ jobs:
               "pr_reviewer.inline_key_issues": False,
               "pr_reviewer.enable_review_labels_security": False,
               "pr_reviewer.enable_review_labels_effort": False,
-              "pr_reviewer.enable_large_pr_chunking": False,
+              "pr_reviewer.max_number_of_calls": CHUNK_CALLS,
+              "pr_reviewer.publish_error_details": True,
               "config.publish_output_progress": False,
               "config.output_run_details": True,
               "config.enable_auto_approval": False,
               "config.num_retries": 0,
-              "config.ai_timeout": 120,
               "config.retry_same_model_on_timeout": False,
               "config.retry_same_model_on_length": False,
               "config.use_repo_settings_file": False,
@@ -142,57 +210,142 @@ jobs:
           }
 
 
+          class WrapperError(ValueError):
+              """A failure whose message is a fixed string that is safe to print."""
+
+
           def require(value, message):
+              # Messages are literals from this file. Never interpolate caller or provider data.
               if not value:
-                  raise ValueError(message)
+                  raise WrapperError(message)
               return value
 
 
           def safe_text(value, limit, multiline=False):
-              require(isinstance(value, str) and len(value.encode("utf-8")) <= limit, "Invalid text size or type")
-              require(not re.search(r"@[A-Za-z]", value), "Dynaconf directive forms are forbidden")
-              require(not any(ord(c) < 32 and (not multiline or c not in "\n\t") for c in value), "Control characters forbidden")
-              require("\x7f" not in value, "Control characters forbidden")
+              require(isinstance(value, str) and len(value.encode("utf-8")) <= limit, "wrong type or too long")
+              # Dynaconf evaluates a value only when it starts with a converter token, so mentions
+              # such as @Override, @types/node, or an email address are safe mid-text. Converter
+              # tokens stay forbidden anywhere in case a later settings copy re-parses a fragment.
+              require(not value.lstrip().startswith("@"), "must not start with an at sign")
+              require(not re.search(r"@(?:" + DIRECTIVES + r")(?![A-Za-z0-9_])", value, re.I),
+                      "must not contain a Dynaconf directive such as @json or @format")
+              require(not any(ord(c) < 32 and (not multiline or c not in "\n\t") for c in value), "control characters are forbidden")
+              require("\x7f" not in value, "control characters are forbidden")
               return value
 
 
           def model(value):
               safe_text(value, 160)
-              require(re.fullmatch(r"(xai|openai|anthropic|gemini)/[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value), "Unsupported provider or model format")
+              segment = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+              message = "expected <provider>/<model> with a supported provider prefix"
+              provider, _, name = value.partition("/")
+              require(provider in KEYS and 0 < len(name) <= 128, message)
+              if provider in NESTED_MODEL_PROVIDERS:
+                  require(re.fullmatch(segment + "(?:/" + segment + r")*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?", name), message)
+              else:
+                  require(re.fullmatch(segment, name), message)
               return value
 
 
           def array_text(value, count, item_limit):
               safe_text(value, 8192, True)
-              parsed = json.loads(value)
-              require(type(parsed) is list and len(parsed) <= count, "Expected bounded JSON array")
+              try:
+                  parsed = json.loads(value)
+              except ValueError:
+                  raise WrapperError("must be a JSON array of strings") from None
+              require(type(parsed) is list and len(parsed) <= count, "must be a JSON array within the documented size")
               for item in parsed:
                   safe_text(item, item_limit)
-                  require(bool(item.strip()), "Empty array item")
-              require(len(set(parsed)) == len(parsed), "Duplicate array item")
+                  require(bool(item.strip()), "array items must not be empty")
+              require(len(set(parsed)) == len(parsed), "array items must be distinct")
               return parsed
 
 
+          def integer(value, low, high, zero_ok=False):
+              require(type(value) is int and ((zero_ok and value == 0) or low <= value <= high), "must be an integer in the documented range")
+              return value
+
+
+          def endpoint(value, chain):
+              safe_text(value, 512)
+              if not value:
+                  return None
+              # Plain HTTPS origin plus path. No credentials, query, or fragment in the URL.
+              require(re.fullmatch(r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?", value),
+                      "must be an https URL without credentials, query, or fragment")
+              require(any(item.startswith("openai/") for item in chain), "requires an openai/ model, which it redirects")
+              return value
+
+
+          def choice(value, allowed):
+              require(isinstance(value, str) and value in allowed, "is not one of the documented values")
+              return value
+
+
+          def boolean(value):
+              require(type(value) is bool, "must be true or false")
+              return value
+
+
+          def language(value):
+              require(isinstance(value, str) and re.fullmatch(r"[a-z]{2,3}-[A-Z]{2}", value), "must be a locale such as en-US")
+              return value
+
+
+          def checked(name, function, *args):
+              # Name the input in the error. The value itself is never echoed.
+              try:
+                  return function(*args)
+              except WrapperError as error:
+                  raise WrapperError("Invalid input `" + name + "`: " + str(error)) from None
+
+
           def settings(inputs):
-              require(set(inputs) == {"model", "fallback_models", "extra_instructions", "num_max_findings", "ignore_globs"}, "Unexpected inputs")
-              primary = model(inputs["model"])
-              fallbacks = array_text(inputs["fallback_models"], 4, 160)
+              require(set(inputs) == INPUT_NAMES, "Unexpected workflow inputs")
+              primary = checked("model", model, inputs["model"])
+              fallbacks = checked("fallback_models", array_text, inputs["fallback_models"], 4, 160)
               for item in fallbacks:
-                  model(item)
-              require(primary not in fallbacks, "Duplicate primary model")
-              count = inputs["num_max_findings"]
-              require(type(count) is int and 1 <= count <= 10, "num_max_findings must be an integer from 1 to 10")
-              globs = array_text(inputs["ignore_globs"], 32, 256)
+                  checked("fallback_models", model, item)
+              checked("fallback_models", require, primary not in fallbacks, "must not repeat the primary model")
+              count = checked("num_max_findings", integer, inputs["num_max_findings"], 1, 10)
+              globs = checked("ignore_globs", array_text, inputs["ignore_globs"], 32, 256)
               # Keep the native vendor exclusion even when callers add patterns.
               globs = list(dict.fromkeys(["vendor/**", *globs]))
-              return {**FIXED, "config.model": primary, "config.fallback_models": fallbacks,
-                      "pr_reviewer.extra_instructions": safe_text(inputs["extra_instructions"], 8192, True),
-                      "pr_reviewer.num_max_findings": count, "ignore.glob": globs}
+              checked("comment_mode", choice, inputs["comment_mode"], COMMENT_MODES)
+              config = {**FIXED, "config.model": primary, "config.fallback_models": fallbacks,
+                        "pr_reviewer.extra_instructions": checked("extra_instructions", safe_text, inputs["extra_instructions"], 8192, True),
+                        "pr_reviewer.num_max_findings": count, "ignore.glob": globs,
+                        "config.ai_timeout": checked("ai_timeout", integer, inputs["ai_timeout"], 30, 540),
+                        "config.max_model_tokens": checked("max_model_tokens", integer, inputs["max_model_tokens"], 4000, 2000000),
+                        "config.response_language": checked("response_language", language, inputs["response_language"]),
+                    "pr_reviewer.enable_large_pr_chunking": checked("large_pr_chunking", boolean, inputs["large_pr_chunking"])}
+              # Optional settings are sent only when set, so upstream defaults apply otherwise.
+              custom = checked("custom_model_max_tokens", integer, inputs["custom_model_max_tokens"], 1000, 2000000, True)
+              if custom:
+                  config["config.custom_model_max_tokens"] = custom
+              if inputs["reasoning_effort"] != "":
+                  config["config.reasoning_effort"] = checked("reasoning_effort", choice, inputs["reasoning_effort"], REASONING_EFFORTS)
+              base = checked("api_base", endpoint, inputs["api_base"], [primary, *fallbacks])
+              if base:
+                  config["openai.api_base"] = base
+              return config
+
+
+          def encode(value):
+              # A TOML literal. PR-Agent reads settings while they are still loading, and in that state
+              # Dynaconf skips "@" converters such as @json but still parses TOML.
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, int):
+                  return str(value)
+              if isinstance(value, str):
+                  return '"' + "".join(c if c >= " " and c not in '"\\\x7f' else "\\u%04x" % ord(c) for c in value) + '"'
+              require(isinstance(value, list), "Unsupported setting type")
+              return "[" + ", ".join(encode(item) for item in value) + "]"
 
 
           def serialize(config):
-              return {key.upper().replace(".", "__"): "@json " + json.dumps(value, ensure_ascii=True)
-                      for key, value in config.items()}
+              return {key.upper().replace(".", "__"): encode(value) for key, value in config.items()}
 
 
           SECRET_ERROR_MESSAGES = {
@@ -216,7 +369,7 @@ jobs:
                   if not isinstance(value, str) or not value.strip():
                       raise MissingProviderSecret(public)
                   safe_text(value, 8192)
-                  result[native] = "@json " + json.dumps(value)
+                  result[native] = encode(value)
               return result
 
 
@@ -362,11 +515,25 @@ jobs:
               text = data.decode("utf-8")
               require("\x00" not in text, "Invalid output")
               chain = [config["config.model"], *config["config.fallback_models"]]
-              lines = re.findall(r"^- Model: ([^\n\r]+)$", text, re.M)
+              single = re.findall(r"^- Model: ([^\n\r]+)$", text, re.M)
+              merged = re.findall(r"^- Models: ([^\n\r]+)$", text, re.M)
               expected = [m + (" (fallback)" if i else "") for i, m in enumerate(chain)]
-              if "Agent run details" not in text or len(lines) != 1 or lines[0] not in expected:
+              known = len(single) == 1 and not merged and single[0] in expected
+              if config["pr_reviewer.enable_large_pr_chunking"] and len(merged) == 1 and not single:
+                  # A chunked review names every model that answered a chunk.
+                  names = merged[0].removesuffix(" (includes fallback)").split(", ")
+                  known = len(names) > 1 and len(set(names)) == len(names) and set(names) <= set(chain)
+              if "Agent run details" not in text or not known:
                   return "missing_model_details"
               return "oversized_output" if len(data) > COMMENT_LIMIT else "success"
+
+
+          def failure_reason(data):
+              # Exact match against PR-Agent's fixed reasons, so provider text can never reach the log.
+              for upstream, message in FAILURE_REASONS.items():
+                  if data.strip() == ("Failed to review PR\n\n**Reason:** " + upstream).encode():
+                      return ". " + message
+              return ""
 
 
           def infer(root):
@@ -387,7 +554,11 @@ jobs:
                   # Explicit literal HOME avoids inheriting the Docker client's home path.
                   cmd[cmd.index("HOME")] = "HOME=/tmp"
                   try:
-                      completed = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+                      # Leave every model in the chain its full ai_timeout, for every chunk, before the container is stopped.
+                      attempts = 1 + len(config["config.fallback_models"])
+                      calls = CHUNK_CALLS if config["pr_reviewer.enable_large_pr_chunking"] else 1
+                      limit = min(1500, max(600, config["config.ai_timeout"] * attempts * calls + 60))
+                      completed = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=limit)
                   finally:
                       subprocess.run(["docker", "rm", "--force", "pr-agent-wrapper-review"], env=clean_env(root),
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
@@ -409,13 +580,17 @@ jobs:
               (root / "artifact/review.md").write_bytes(data)
               meta.update(status=status, review_sha256=digest(data))
               manifest_path.write_text(json.dumps(meta))
-              require(status == "success", "Review failed: " + status)
+              require(status == "success", "Review failed: " + status + (failure_reason(data) if status == "inference_failed" else ""))
 
 
           if __name__ == "__main__":
               try:
                   root = Path(os.environ["RUNNER_TEMP"]) / "prw"
                   {"prepare": prepare, "build": build, "infer": infer}[sys.argv[1]](root)
+              except WrapperError as error:
+                  # Fixed wording from this file, shown as an annotation on the run.
+                  print("::error title=PR-Agent wrapper::" + str(error))
+                  raise SystemExit(1)
               except Exception:
                   print("Wrapper step failed; no provider details are logged.", file=sys.stderr)
                   raise SystemExit(1)
@@ -452,6 +627,10 @@ jobs:
           OPENAI_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'openai') && secrets.OPENAI_API_KEY || '' }}
           ANTHROPIC_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'anthropic') && secrets.ANTHROPIC_API_KEY || '' }}
           GEMINI_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'gemini') && secrets.GEMINI_API_KEY || '' }}
+          OPENROUTER_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'openrouter') && secrets.OPENROUTER_API_KEY || '' }}
+          GROQ_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'groq') && secrets.GROQ_API_KEY || '' }}
+          DEEPSEEK_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'deepseek') && secrets.DEEPSEEK_API_KEY || '' }}
+          MISTRAL_API_KEY: ${{ contains(fromJSON(needs.capture.outputs.providers), 'mistral') && secrets.MISTRAL_API_KEY || '' }}
         shell: bash
         run: python3 "$RUNNER_TEMP/prw/runtime.py" infer
       - name: Upload captured comparison and native result
@@ -476,9 +655,10 @@ jobs:
         with:
           name: pr-review-result-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/prw-artifact/
-      - name: Validate artifact and create a new issue comment
+      - name: Validate artifact and publish the review comment
         env:
           CAPTURED_JSON: ${{ toJSON(needs.capture.outputs) }}
+          COMMENT_MODE: ${{ inputs.comment_mode }}
           GH_PUBLISH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
@@ -494,11 +674,22 @@ jobs:
 
           UPSTREAM = "efdde4afe14aa401a3889012c7f3e9ef3081a430"
           STATUSES = {"success", "not_run", "key_validation_failed", "inference_failed", "empty_output", "oversized_output", "missing_model_details"}
+          PROVIDERS = "xai|openai|anthropic|gemini|openrouter|groq|deepseek|mistral"
+          MODEL = "(?:" + PROVIDERS + ")/[A-Za-z0-9][A-Za-z0-9._:/-]*"
+          COMMENT_MODES = {"update", "new"}
+          # First line of every comment this workflow writes. Update mode edits only a
+          # comment that starts with it and was written by the Actions bot.
+          MARKER = "<!-- pr-agent-wrapper:review -->"
+          BOT = "github-actions[bot]"
+
+
+          class WrapperError(ValueError):
+              """A failure whose message is a fixed string that is safe to print."""
 
 
           def require(value, message):
               if not value:
-                  raise ValueError(message)
+                  raise WrapperError(message)
 
 
           def read_file(root, name, limit):
@@ -550,12 +741,45 @@ jobs:
               require("\x00" not in text, "Invalid Markdown")
               if manifest["status"] == "success":
                   require(text.strip() and len(review) <= 60000 and "Agent run details" in text
-                          and re.search(r"^- Model: (xai|openai|anthropic|gemini)/[A-Za-z0-9][A-Za-z0-9._-]*( \(fallback\))?$", text, re.M), "Missing native output or model identity")
+                          and re.search(r"^- (Model: " + MODEL + r"( \(fallback\))?|Models: " + MODEL + "(, " + MODEL + r")+( \(includes fallback\))?)$", text, re.M), "Missing native output or model identity")
               return manifest, text
 
 
-          def publish(root, expected, client):
+          def summary(text):
+              # Fixed wording plus validated identifiers only.
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a") as f:
+                      f.write(text + "\n")
+              print(text)
+
+
+          def own_comment(client, repository, number):
+              """Return (id, body) of this workflow's newest comment on the PR, or None."""
+              found = None
+              for page in range(1, 51):
+                  comments = client.list_comments(repository, number, page)
+                  require(type(comments) is list, "Unexpected comment listing")
+                  for item in comments:
+                      user = item.get("user") or {}
+                      if (user.get("login") == BOT and user.get("type") == "Bot" and isinstance(item.get("body"), str)
+                              and item["body"].startswith(MARKER) and type(item.get("id")) is int and item["id"] > 0):
+                          found = (item["id"], item["body"])
+                  if len(comments) < 20:
+                      break
+              return found
+
+
+          def publish(root, expected, client, mode="update"):
+              require(mode in COMMENT_MODES, "Invalid comment mode")
               manifest, native = validate(root, expected)
+              if manifest["status"] != "success":
+                  # A failed run leaves the PR conversation alone; the review job is already red.
+                  note = "PR-Agent review produced no comment. Status: `" + manifest["status"] + "`."
+                  if manifest["status"] in {"oversized_output", "missing_model_details"}:
+                      note += " Native output is retained in this run's artifact without truncation."
+                  summary(note)
+                  return None
               current = client.get_pr(expected["repository"], expected["pr_number"])
               require(current["base"]["repo"]["full_name"] == expected["repository"] and
                       current["head"]["repo"]["full_name"] == expected["repository"] and
@@ -563,29 +787,36 @@ jobs:
               require(current["state"] == "open" and current["draft"] is False, "PR is now closed or draft")
               for side in ("base", "head"):
                   require(re.fullmatch(r"[0-9a-f]{40}", current[side]["sha"]), "Invalid current object ID")
-              prefix = ("PR-Agent captured comparison\n\n"
+              advanced = any(current[k]["sha"] != expected[k] for k in ("base", "head"))
+              existing = own_comment(client, expected["repository"], expected["pr_number"]) if mode == "update" else None
+              if existing and current["head"]["sha"] != expected["head"] and ("Head: `" + current["head"]["sha"] + "`") in existing[1]:
+                  # A newer run already reviewed the current head. Do not overwrite it with an older review.
+                  summary("PR-Agent review skipped: the comment already covers a newer head than this run captured.")
+                  return None
+              prefix = (MARKER + "\nPR-Agent captured comparison\n\n"
                         f"Repository: `{expected['repository']}`; PR: #{expected['pr_number']}\n"
                         f"Base: `{expected['base']}`\nHead: `{expected['head']}`\n"
                         f"Merge base: `{expected['merge_base']}`\nDiff SHA256: `{expected['diff_sha256']}`\n\n")
-              if any(current[k]["sha"] != expected[k] for k in ("base", "head")):
+              if advanced:
                   prefix += "The PR advanced after capture. This output describes the captured SHAs above.\n\n"
-              if manifest["status"] == "success":
-                  body = prefix + native
-              else:
-                  body = prefix + "Review did not produce a publishable result. Status: `" + manifest["status"] + "`.\n"
-                  if manifest["status"] in {"oversized_output", "missing_model_details"}:
-                      body += "Native output is retained in this run's artifact without truncation.\n"
+              body = prefix + native
               require(len(body.encode("utf-8")) <= 65000, "Comment too large")
-              # A single new issue comment. No evaluation, old-comment edits, or review events.
-              return client.create_comment(expected["repository"], expected["pr_number"], body)
+              # One comment per call. No evaluation, review events, labels, or edits to other authors' comments.
+              if existing is None:
+                  result = client.create_comment(expected["repository"], expected["pr_number"], body)
+                  summary("PR-Agent review posted as a new comment.")
+              else:
+                  result = client.update_comment(expected["repository"], existing[0], body)
+                  summary("PR-Agent review updated the existing comment.")
+              return result
 
 
           class GitHubClient:
               def __init__(self, token):
                   self.token = token
 
-              def request(self, path, payload=None):
-                  request = urllib.request.Request("https://api.github.com/repos/" + path,
+              def request(self, path, payload=None, method=None, limit=2 * 1024 * 1024):
+                  request = urllib.request.Request("https://api.github.com/repos/" + path, method=method,
                                                    data=None if payload is None else json.dumps(payload).encode(),
                                                    headers={"Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
                                                             "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"})
@@ -595,22 +826,33 @@ jobs:
                           return None
                   opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
                   with opener.open(request, timeout=30) as response:
-                      data = response.read(2 * 1024 * 1024 + 1)
-                      require(len(data) <= 2 * 1024 * 1024, "API response too large")
+                      data = response.read(limit + 1)
+                      require(len(data) <= limit, "API response too large")
                       return json.loads(data)
 
               def get_pr(self, repository, number):
                   return self.request(f"{repository}/pulls/{number}")
 
+              def list_comments(self, repository, number, page):
+                  # 20 comments at GitHub's size limit, in the widest encoding, fit in the raised limit.
+                  return self.request(f"{repository}/issues/{number}/comments?per_page=20&page={page}", limit=8 * 1024 * 1024)
+
               def create_comment(self, repository, number, body):
                   # No automatic POST retries: a lost response must not create duplicates.
                   return self.request(f"{repository}/issues/{number}/comments", {"body": body})
+
+              def update_comment(self, repository, comment_id, body):
+                  return self.request(f"{repository}/issues/comments/{comment_id}", {"body": body}, method="PATCH")
 
 
           if __name__ == "__main__":
               try:
                   expected = expected_identity(json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text()), os.environ)
-                  publish(Path(os.environ["RUNNER_TEMP"]) / "prw-artifact", expected, GitHubClient(os.environ["GH_PUBLISH_TOKEN"]))
+                  publish(Path(os.environ["RUNNER_TEMP"]) / "prw-artifact", expected, GitHubClient(os.environ["GH_PUBLISH_TOKEN"]),
+                          os.environ.get("COMMENT_MODE", ""))
+              except WrapperError as error:
+                  print("::error title=PR-Agent wrapper::" + str(error))
+                  raise SystemExit(1)
               except Exception:
                   print("Publishing failed; artifact validation or comment creation did not complete.", file=sys.stderr)
                   raise SystemExit(1)

@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 from dynaconf import Dynaconf
 from tenacity import retry, retry_if_exception, stop_after_attempt
 
-from support import functions, inputs, review, upstream
+from support import chains, functions, inputs, review, upstream
 
 
 class APIError(Exception): pass
@@ -42,7 +42,7 @@ class ModelType(enum.Enum):
     REASONING = 3
 
 
-def config_scope(config):
+def config_scope(config, extra_env=None):
     """Use the pinned loader, file defaults, and Dynaconf env loader together."""
     class Scope:
         def __enter__(self):
@@ -62,7 +62,7 @@ def config_scope(config):
             (root / "settings").mkdir()
             for name in ["configuration.toml", "ignore.toml"]:
                 (root / "settings" / name).write_text(upstream("pr_agent/settings/" + name))
-            self.env = patch.dict(os.environ, review.serialize(config), clear=True)
+            self.env = patch.dict(os.environ, {**review.serialize(config), **(extra_env or {})}, clear=True)
             self.env.start()
             namespace = {"__file__": str(root / "config_loader.py")}
             exec(compile(upstream("pr_agent/config_loader.py"), "config_loader.py", "exec"), namespace)
@@ -77,8 +77,11 @@ def config_scope(config):
 
 class ConfigSemanticsTests(unittest.TestCase):
     def test_real_pinned_loader_replaces_primary_and_fallback_defaults(self):
-        for fallbacks in [[], ["openai/a", "anthropic/b", "gemini/c"]]:
-            config = review.settings(inputs(fallback_models=json.dumps(fallbacks), extra_instructions='Check "package.json"\nthen docs.'))
+        tuned = {"api_base": "https://llm.example.com/v1", "custom_model_max_tokens": 128000, "max_model_tokens": 64000,
+                 "reasoning_effort": "high", "response_language": "pt-BR", "ai_timeout": 300}
+        for fallbacks, extra in [([], {}), (["openai/a", "anthropic/b", "gemini/c"], {}), (["openai/a", "openrouter/x-ai/grok-4.6:free"], tuned)]:
+            config = review.settings(inputs(fallback_models=json.dumps(fallbacks), extra_instructions='Check "package.json"\nthen docs; skip @Override and a@b.co.', **extra))
+            self.assertEqual("openai.api_base" in config, bool(extra))
             with config_scope(config) as settings:
                 for key, value in config.items():
                     self.assertEqual(settings.get(key), value, key)
@@ -87,19 +90,35 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertEqual(settings.config.model, "xai/grok-4.7")
                 self.assertFalse(settings.config.get("use_repo_settings_file"))
 
-    def test_key_mapping_real_env_loader(self):
-        config = review.settings(inputs(fallback_models='["openai/a","anthropic/b","gemini/c"]'))
-        keys = {public: "test-only-" + provider for provider, (public, _) in review.KEYS.items()}
-        with patch.dict(os.environ, review.provider_keys(config, keys), clear=True):
+    def test_settings_keep_their_types_when_dynaconf_skips_converters(self):
+        # PR-Agent's logger reads settings mid-load; Dynaconf then skips "@" converters, as it does here.
+        config = review.settings(inputs(fallback_models='["openai/a"]', extra_instructions='say "hi"\nplease'))
+        with config_scope(config, {"AUTO_CAST_FOR_DYNACONF": "false"}) as settings:
+            for key, value in config.items():
+                self.assertEqual(settings.get(key), value, key)
+                self.assertIsInstance(settings.get(key), type(value), key)
+        keys = {"XAI_API_KEY": "test-only-xai", "OPENAI_API_KEY": "123"}
+        with patch.dict(os.environ, {**review.provider_keys(config, keys), "AUTO_CAST_FOR_DYNACONF": "false"}, clear=True):
             settings = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[], merge_enabled=False)
-            for provider, (public, native) in review.KEYS.items():
-                self.assertEqual(settings.get(native.replace("__", ".")), keys[public])
-            self.assertIsNone(settings.get("OPENAI.API_BASE"))
+            self.assertEqual((settings.get("XAI.KEY"), settings.get("OPENAI.KEY")), ("test-only-xai", "123"))
+
+    def test_key_mapping_real_env_loader(self):
+        keys = {public: "test-only-" + provider for provider, (public, _) in review.KEYS.items()}
+        seen = set()
+        for group, chain in chains():
+            with patch.dict(os.environ, review.provider_keys(review.settings(chain), keys), clear=True):
+                settings = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[], merge_enabled=False)
+                for provider, (public, native) in review.KEYS.items():
+                    self.assertEqual(settings.get(native.replace("__", ".")), keys[public] if provider in group else None)
+                self.assertIsNone(settings.get("OPENAI.API_BASE"))
+            seen.update(group)
+        self.assertEqual(seen, set(review.KEYS))
         tree = ast.parse(upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
         provider_paths = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
                               and any(isinstance(t, ast.Name) and t.id == "PROVIDER_SETTING_PATHS" for t in n.targets))
-        for provider in ["xai", "anthropic", "gemini"]:
+        for provider in set(review.KEYS) - {"openai"}:
             self.assertEqual(provider_paths[provider]["api_key"], review.KEYS[provider][1].replace("__", "."))
+        self.assertIn('configured_api_base = settings.get("OPENAI.API_BASE", None)', upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
         self.assertIn('"api_key": settings.get("OPENAI.KEY", None)', upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
 
     def test_wrapped_evaluators_are_rejected_before_dynaconf(self):
@@ -112,6 +131,14 @@ class ConfigSemanticsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 review.settings(inputs(extra_instructions=payload))
 
+    def test_failure_reasons_match_pinned_source(self):
+        values = {}
+        for node in ast.parse(upstream("pr_agent/tools/pr_reviewer.py")).body:
+            if isinstance(node, ast.Assign) and node.targets[0].id in {"_REVIEW_FAILURE_REASONS", "_UNKNOWN_REVIEW_FAILURE_REASON"}:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+        reasons = {reason for _, reason in values["_REVIEW_FAILURE_REASONS"]} | {values["_UNKNOWN_REVIEW_FAILURE_REASON"]}
+        self.assertEqual(set(review.FAILURE_REASONS), reasons)
+
     def test_all_fixed_keys_exist_in_pinned_source(self):
         defaults = tomllib.loads(upstream("pr_agent/settings/configuration.toml"))
         handler = upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py")
@@ -121,6 +148,12 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertIn('get("num_retries", None)', handler)
             else:
                 self.assertIn(field, defaults[section], key)
+        tuned = review.settings(inputs(model="openai/a", api_base="https://llm.example.com/v1", custom_model_max_tokens=128000, reasoning_effort="low"))
+        for key in set(tuned) - set(review.FIXED) - {"ignore.glob", "openai.api_base"}:
+            section, field = key.split(".")
+            self.assertIn(field, defaults[section], key)
+        self.assertIn(defaults["config"]["reasoning_effort"], review.REASONING_EFFORTS)
+        self.assertEqual((defaults["config"]["ai_timeout"], defaults["config"]["max_model_tokens"], defaults["config"]["response_language"]), (120, 32000, "en-US"))
         self.assertEqual(defaults["config"]["model"], "gpt-6.1-sol")
         self.assertEqual(defaults["config"]["fallback_models"], ["gpt-6-luna"])
 

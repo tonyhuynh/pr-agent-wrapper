@@ -4,6 +4,9 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 permissions:
   contents: read
+concurrency:
+  group: pr-agent-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 jobs:
   review:
     permissions:
@@ -11,6 +14,7 @@ jobs:
       pull-requests: write
     uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
     with:
+      model: xai/grok-4.7
       extra_instructions: Focus on the workflow, package.json and docs.
     secrets:
       XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
