@@ -6,7 +6,7 @@ On each push to a PR, it sends the diff to the model and posts the review as one
 
 ## Should you use this or PR-Agent's own GitHub Action
 
-The PR-Agent project publishes [its own GitHub Action](https://github.com/The-PR-Agent/pr-agent/blob/main/docs/docs/installation/github.md), which runs everything in one job. It is simpler to set up and does more. It reads the whole repository, answers commands in PR comments, and can write PR descriptions and code suggestions. Choose it when you need any of that.
+The PR-Agent project publishes [its own GitHub Action](https://github.com/The-PR-Agent/pr-agent/blob/main/docs/docs/installation/github.md), which runs everything in one job. It is simpler to set up and does more. It shows the model the changed files in full along with the PR's title and description, answers commands in PR comments, and can write PR descriptions and code suggestions. Choose it when you need any of that.
 
 This wrapper gives up those features to limit what a hostile PR can do:
 
@@ -14,7 +14,7 @@ This wrapper gives up those features to limit what a hostile PR can do:
 - The PR's code is never checked out or run, and PR-Agent ignores configuration files in the repository, so a PR cannot change how it is reviewed.
 - PR-Agent runs from a pinned commit with verified file hashes, in a container with no root, no writable filesystem, and no capabilities.
 
-The cost is context. The model sees the diff with three lines around each change, so it misses problems that need the rest of the codebase. PRs from forks are not reviewed.
+The cost is context. The model sees only the diff, with three lines around each change. It does not see the rest of each file or the PR's title and description, so it can miss problems that depend on either. PRs from forks are not reviewed.
 
 ## Set it up
 
