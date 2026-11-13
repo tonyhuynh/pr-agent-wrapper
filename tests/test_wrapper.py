@@ -83,7 +83,8 @@ class InputTests(unittest.TestCase):
                "reasoning_effort": ["extreme", "High", " high", 3, None],
                "response_language": ["english", "en_US", "en-us", "", None],
                "ai_timeout": [0, 29, 541, 120.0, True],
-               "comment_mode": ["", "replace", "UPDATE", None]}
+               "comment_mode": ["", "replace", "UPDATE", None],
+               "large_pr_chunking": ["true", 1, 0, None, ""]}
         for name, values in bad.items():
             for value in values:
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
@@ -96,7 +97,7 @@ class InputTests(unittest.TestCase):
     def test_input_errors_name_the_input_without_echoing_the_value(self):
         cases = {"model": "not-a-model-SENTINEL", "fallback_models": '["SENTINEL"', "extra_instructions": "@jinja SENTINEL",
                  "num_max_findings": 99, "ignore_globs": '{"SENTINEL": 1}', "api_base": "http://SENTINEL", "custom_model_max_tokens": 5,
-                 "max_model_tokens": 1, "reasoning_effort": "SENTINEL", "response_language": "SENTINEL", "ai_timeout": 1, "comment_mode": "SENTINEL"}
+                 "max_model_tokens": 1, "reasoning_effort": "SENTINEL", "response_language": "SENTINEL", "ai_timeout": 1, "comment_mode": "SENTINEL", "large_pr_chunking": "SENTINEL"}
         self.assertEqual(set(cases), review.INPUT_NAMES)
         for name, value in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -210,7 +211,9 @@ class InputTests(unittest.TestCase):
 
     def test_container_timeout_covers_the_whole_chain(self):
         for changes, expected_limit in [({"ai_timeout": 540}, 600), ({"ai_timeout": 540, "fallback_models": '["openai/a"]'}, 1140),
-                                        ({"ai_timeout": 540, "fallback_models": '["openai/a","openai/b","openai/c"]'}, 1500)]:
+                                        ({"ai_timeout": 540, "fallback_models": '["openai/a","openai/b","openai/c"]'}, 1500),
+                                        ({"ai_timeout": 120, "large_pr_chunking": True}, 600), ({"ai_timeout": 300, "large_pr_chunking": True}, 960),
+                                        ({"ai_timeout": 300, "large_pr_chunking": True, "fallback_models": '["openai/a"]'}, 1500)]:
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "artifact").mkdir()
@@ -266,6 +269,24 @@ class InputTests(unittest.TestCase):
                 self.assertNotIn("\n", review.encode(value))
         for value in [None, 1.5, {"a": 1}, ["a", {"b": 1}]]:
             with self.assertRaises(ValueError): review.encode(value)
+
+    def test_chunked_reviews_may_name_several_chain_models(self):
+        plain = review.settings(inputs(fallback_models='["openai/a"]'))
+        chunked = review.settings(inputs(fallback_models='["openai/a"]', large_pr_chunking=True))
+        self.assertEqual((plain["pr_reviewer.enable_large_pr_chunking"], chunked["pr_reviewer.enable_large_pr_chunking"]), (False, True))
+        self.assertEqual(chunked["pr_reviewer.max_number_of_calls"], 3)
+        body = "Review\n\nAgent run details\n"
+        cases = [("- Model: xai/grok-4.7\n", "success", "success"), ("- Model: openai/a (fallback)\n", "success", "success"),
+                 ("- Models: xai/grok-4.7, openai/a (includes fallback)\n", "missing_model_details", "success"),
+                 ("- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "success"),
+                 ("- Models: xai/grok-4.7, openai/other\n", "missing_model_details", "missing_model_details"),
+                 ("- Models: xai/grok-4.7, xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
+                 ("- Models: xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
+                 ("- Model: xai/grok-4.7\n- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "missing_model_details")]
+        for footer, without, with_chunking in cases:
+            with self.subTest(footer=footer):
+                self.assertEqual(review.classify((body + footer).encode(), plain), without)
+                self.assertEqual(review.classify((body + footer).encode(), chunked), with_chunking)
 
     def test_secret_diagnostic_accepts_only_known_names(self):
         self.assertEqual(set(review.SECRET_ERROR_MESSAGES), {public for public, _ in review.KEYS.values()})
@@ -653,7 +674,9 @@ class WorkflowTests(unittest.TestCase):
         # Workflow defaults must pass validation unchanged once a model is supplied.
         defaults = {name: spec["default"] for name, spec in declared["inputs"].items() if "default" in spec}
         numbers = {name for name, spec in declared["inputs"].items() if spec["type"] == "number"}
-        review.settings({"model": "xai/grok-4.7", **{k: int(v) if k in numbers else v for k, v in defaults.items()}})
+        booleans = {name for name, spec in declared["inputs"].items() if spec["type"] == "boolean"}
+        review.settings({"model": "xai/grok-4.7", **{k: int(v) if k in numbers else v == "true" if k in booleans else v for k, v in defaults.items()}})
+        self.assertEqual(booleans, {"large_pr_chunking"})
         for value in (source("review"), source("publish")):
             self.assertNotIn("${{", value)
         import check_tree

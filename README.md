@@ -139,6 +139,7 @@ Only `model` is required.
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
 | `max_model_tokens` | `64000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000. PR-Agent's own default is 32000 |
 | `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
+| `large_pr_chunking` | `false` | When a diff does not fit `max_model_tokens`, split it and review it in up to 3 model calls instead of leaving files out |
 | `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint. Needs an `openai/` model |
 | `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know, 1000 to 2000000; 0 leaves it unset |
 
@@ -150,7 +151,7 @@ Text inputs cannot start with an at sign or contain a Dynaconf directive such as
 - **Pushes during a review.** If the PR moved while a review was running, the comment says so and still names the commits it covers. If a newer run already reviewed the newer head, the older run writes nothing.
 - **Failures stay off the PR.** A failed review fails the job and writes the reason to the job summary. The last good review stays in place.
 - **A run takes about two minutes.** Each run builds PR-Agent from source, which is about one minute of that.
-- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. Each review of a large PR then costs more and takes longer, so you may need a higher `ai_timeout` too.
+- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. Each review of a large PR then costs more and takes longer, so you may need a higher `ai_timeout` too. For a diff that outgrows even that, or a model with a small context, set `large_pr_chunking: true`. PR-Agent then reviews the diff in up to 3 slices and merges the results. That costs up to 3 calls, and an issue that spans two slices can be missed.
 - **Your provider sees the diff.** The diff and review are also kept as workflow artifacts for 3 days. See [SECURITY.md](SECURITY.md) before using this on code that must not leave the repository.
 
 ### Example comment
