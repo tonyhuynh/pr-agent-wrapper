@@ -137,7 +137,7 @@ Only `model` is required.
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
 | `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR` |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
-| `max_model_tokens` | `32000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000 |
+| `max_model_tokens` | `64000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000. PR-Agent's own default is 32000 |
 | `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
 | `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint. Needs an `openai/` model |
 | `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know, 1000 to 2000000; 0 leaves it unset |
@@ -149,8 +149,43 @@ Text inputs cannot start with an at sign or contain a Dynaconf directive such as
 - **One comment.** It starts with the repository, PR number, base SHA, head SHA, and a hash of the diff that was reviewed, followed by PR-Agent's review. In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. In `new` mode every run, including a rerun, adds a comment.
 - **Pushes during a review.** If the PR moved while a review was running, the comment says so and still names the commits it covers. If a newer run already reviewed the newer head, the older run writes nothing.
 - **Failures stay off the PR.** A failed review fails the job and writes the reason to the job summary. The last good review stays in place.
-- **Each run builds PR-Agent from source**, so the build adds to every run's time.
+- **A run takes about two minutes.** Each run builds PR-Agent from source, which is about one minute of that.
+- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. Each review of a large PR then costs more and takes longer, so you may need a higher `ai_timeout` too.
 - **Your provider sees the diff.** The diff and review are also kept as workflow artifacts for 3 days. See [SECURITY.md](SECURITY.md) before using this on code that must not leave the repository.
+
+### Example comment
+
+A made-up review of a one-line change, in the format the workflow posts:
+
+```text
+PR-Agent captured comparison
+
+Repository: example/calculator; PR: #12
+Base: 1f0c...
+Head: 9ab4...
+Merge base: 1f0c...
+Diff SHA256: 5d2e...
+
+PR Reviewer Guide
+
+Estimated effort to review: 1
+No relevant tests
+No security concerns identified
+Recommended focus areas for review
+
+  Wrong divisor
+  average() now divides by len(values) - 1, so it returns 3.0 for
+  [1, 2, 3] and raises ZeroDivisionError for a single value.
+  Divide by len(values).
+
+Agent run details
+- Model: openai/gpt-6.1-sol
+- Tokens: 1,240 in / 310 out / 1,550 total
+- Time cost: 6.2s
+- AI calls: 1
+```
+
+The real comment prints full SHAs and renders as Markdown, with PR-Agent's table layout and icons.
 
 ## When something goes wrong
 

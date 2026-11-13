@@ -66,7 +66,7 @@ class InputTests(unittest.TestCase):
 
     def test_optional_tuning_inputs(self):
         config = review.settings(inputs())
-        self.assertEqual((config["config.ai_timeout"], config["config.max_model_tokens"], config["config.response_language"]), (120, 32000, "en-US"))
+        self.assertEqual((config["config.ai_timeout"], config["config.max_model_tokens"], config["config.response_language"]), (120, 64000, "en-US"))
         for absent in ["config.custom_model_max_tokens", "config.reasoning_effort", "openai.api_base"]:
             self.assertNotIn(absent, config)
         config = review.settings(inputs(model="openai/local-model", api_base="https://llm.example.com:8443/v1", custom_model_max_tokens=128000,

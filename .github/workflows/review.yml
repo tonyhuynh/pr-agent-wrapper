@@ -25,7 +25,7 @@ on:
         default: 0
       max_model_tokens:
         type: number
-        default: 32000
+        default: 64000
       reasoning_effort:
         type: string
         default: ''

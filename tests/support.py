@@ -17,7 +17,7 @@ def inputs(**changes):
     # Mirrors toJSON(inputs): the caller's model plus every workflow default.
     return {"model": "xai/grok-4.7", "fallback_models": "[]", "extra_instructions": "",
             "num_max_findings": 3, "ignore_globs": '["vendor/**"]', "api_base": "",
-            "custom_model_max_tokens": 0, "max_model_tokens": 32000, "reasoning_effort": "",
+            "custom_model_max_tokens": 0, "max_model_tokens": 64000, "reasoning_effort": "",
             "response_language": "en-US", "ai_timeout": 120, "comment_mode": "update", **changes}
 
 
