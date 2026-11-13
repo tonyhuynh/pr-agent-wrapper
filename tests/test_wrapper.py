@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
+import types
 import unittest
 from unittest.mock import patch
 
@@ -81,7 +82,10 @@ class InputTests(unittest.TestCase):
                           config["config.response_language"], config["config.ai_timeout"]), (128000, 64000, "high", "pt-BR", 300))
         self.assertNotIn("comment_mode", " ".join(config))
         bad = {"api_base": ["http://llm.example.com/v1", "https://user:pass@llm.example.com", "https://llm.example.com/v1?key=x", "https://llm.example.com/#x",
-                            "file:///etc/passwd", "https://", "https://-bad.example.com", "https://llm.example.com/a b", 7],
+                            "file:///etc/passwd", "https://", "https://-bad.example.com", "https://llm.example.com/a b", 7,
+                            "https://127.0.0.1/v1", "https://169.254.169.254/latest", "https://2130706433/v1", "https://localhost/v1", "https://intranet/v1",
+                            "https://api.localhost/v1", "https://llm.corp.internal/v1", "https://printer.local", "https://a..example.com", "https://a-.example.com",
+                            "https://llm.example.com:0/v1", "https://llm.example.com:65536/v1", "https://llm.example.com:99999"],
                "custom_model_max_tokens": [-1, 999, 2000001, 1.5, True, "128000", None],
                "max_model_tokens": [0, 3999, 2000001, True, "32000"],
                "reasoning_effort": ["extreme", "High", " high", 3, None],
@@ -587,6 +591,38 @@ class PublishTests(unittest.TestCase):
             client = self.Client()
             with self.assertRaises(ValueError): publisher.publish(root, meta, client)
             self.assertFalse(client.comments)
+
+    def test_comment_listing_is_bounded(self):
+        # Other bots can fill a PR with comments; the search stops after 50 pages of 20.
+        others = [self.comment(i, "unrelated") for i in range(1, 1201)]
+        client = self.Client(others)
+        self.assertIsNone(publisher.own_comment(client, "example/repository", 7))
+        self.assertEqual(client.pages, list(range(1, 51)))
+        # The newest marked comment within those pages wins; one past the cap is not seen.
+        marked = [self.comment(i, publisher.MARKER + "\nreview " + str(i)) if i in {3, 999, 1001} else self.comment(i, "unrelated") for i in range(1, 1201)]
+        self.assertEqual(publisher.own_comment(self.Client(marked), "example/repository", 7), (999, publisher.MARKER + "\nreview 999"))
+        with self.assertRaises(ValueError): publisher.own_comment(types.SimpleNamespace(list_comments=lambda *args: {"message": "not a list"}), "example/repository", 7)
+
+    def test_api_responses_over_the_size_limit_are_rejected(self):
+        class Response:
+            def __init__(self, data): self.data = data
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self, count): return self.data[:count]
+        seen = []
+        def opener_for(data):
+            def open_(request, timeout):
+                seen.append((request.full_url, request.get_header("Authorization")))
+                return Response(data)
+            return types.SimpleNamespace(open=open_)
+        client = publisher.GitHubClient("stub-token")
+        with patch.object(publisher.urllib.request, "build_opener", return_value=opener_for(b"[]")):
+            self.assertEqual(client.list_comments("example/repository", 7, 2), [])
+        self.assertEqual(seen, [("https://api.github.com/repos/example/repository/issues/7/comments?per_page=20&page=2", "Bearer stub-token")])
+        with patch.object(publisher.urllib.request, "build_opener", return_value=opener_for(b"[" + b" " * (8 * 1024 * 1024) + b"]")):
+            with self.assertRaises(ValueError): client.list_comments("example/repository", 7, 1)
+        with patch.object(publisher.urllib.request, "build_opener", return_value=opener_for(b"{" + b" " * (2 * 1024 * 1024) + b"}")):
+            with self.assertRaises(ValueError): client.get_pr("example/repository", 7)
 
     def test_only_the_final_run_details_block_names_the_model(self):
         config = review.settings(inputs())
