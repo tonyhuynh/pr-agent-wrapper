@@ -108,6 +108,7 @@ jobs:
               "pr_agent/settings/configuration.toml": "59a91bd441365757bbf3ad5d3a487afb18d3d718",
               "pr_agent/settings/ignore.toml": "938d7fb648260320975ee7f6a086328696c2ccbc",
               "pr_agent/algo/pr_processing.py": "51c302a0dc2604e5a61c63aad8efbacbf22741fa",
+              "pr_agent/algo/ai_handlers/cloud_auth.py": "d1bba80193204e64e56155f8d26e904a4864602d",  # gitleaks:allow (a public Git blob ID; the path contains "auth")
               "pr_agent/algo/ai_handlers/litellm_ai_handler.py": "05da9c02a6c11931ed685037165f50f9ead74f65",
               "pr_agent/git_providers/plain_diff_provider.py": "4908670602d7723468e0c036ff41b5d8c0e6c8c3",
               "pr_agent/algo/run_output.py": "7cb1600a505ea9a2e457734cb0ad996d9d8608a5",
@@ -274,8 +275,14 @@ jobs:
               if not value:
                   return None
               # Plain HTTPS origin plus path. No credentials, query, or fragment in the URL.
-              require(re.fullmatch(r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?", value),
-                      "must be an https URL without credentials, query, or fragment")
+              match = re.fullmatch(r"https://([A-Za-z0-9.-]{1,253})(?::([0-9]{1,5}))?(?:/[A-Za-z0-9._~/-]*)?", value)
+              require(match, "must be an https URL without credentials, query, or fragment")
+              labels = match.group(1).lower().split(".")
+              # A public DNS name: no IP literal, no single-label or local-only host.
+              require(len(labels) >= 2 and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels)
+                      and re.fullmatch(r"[a-z][a-z0-9-]*", labels[-1]) and labels[-1] not in {"localhost", "local", "internal"},
+                      "must name a public host, not an IP address or a local name")
+              require(match.group(2) is None or 1 <= int(match.group(2)) <= 65535, "must use a port from 1 to 65535")
               require(any(item.startswith("openai/") for item in chain), "requires an openai/ model, which it redirects")
               return value
 

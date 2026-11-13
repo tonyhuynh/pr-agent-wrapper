@@ -144,7 +144,7 @@ Only `model` is required.
 | `max_model_tokens` | `64000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000. PR-Agent's own default is 32000 |
 | `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
 | `large_pr_chunking` | `false` | When a diff does not fit `max_model_tokens`, split it and review it in up to 3 model calls instead of leaving files out |
-| `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint. Needs an `openai/` model |
+| `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint, on a public host name. IP addresses and local names are rejected. Needs an `openai/` model |
 | `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know, 1000 to 2000000; 0 leaves it unset |
 
 Text inputs cannot start with an at sign or contain a Dynaconf directive such as `@json` or `@format`, because PR-Agent's settings loader would evaluate it. Mentions like `@Override` or `@types/node` inside a sentence are fine.
