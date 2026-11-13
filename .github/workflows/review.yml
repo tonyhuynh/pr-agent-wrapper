@@ -129,8 +129,8 @@ jobs:
               "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK__KEY"),
               "mistral": ("MISTRAL_API_KEY", "MISTRAL__KEY"),
           }
-          # Routers address models as vendor/model[:variant]; direct providers do not.
-          NESTED_MODEL_PROVIDERS = {"openrouter"}
+          # OpenRouter and Groq address models as vendor/model[:variant]; the other providers do not.
+          NESTED_MODEL_PROVIDERS = {"openrouter", "groq"}
           INPUT_NAMES = {"model", "fallback_models", "extra_instructions", "num_max_findings", "ignore_globs",
                          "api_base", "custom_model_max_tokens", "max_model_tokens", "reasoning_effort",
                          "response_language", "ai_timeout", "comment_mode", "large_pr_chunking"}

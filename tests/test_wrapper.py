@@ -29,7 +29,7 @@ class InputTests(unittest.TestCase):
                       "xai/", "openrouter/", "openrouter/x/../y", "openrouter//y", "openrouter/x/y:", "openrouter/x:a/y", "openrouter/x/y?z", "xai/" + "a" * 129]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 review.settings(inputs(model=value))
-        for value in ["openrouter/x-ai/grok-4.6", "openrouter/meta/llama-4:free", "groq/llama-4", "deepseek/deepseek-chat", "mistral/mistral-large-latest", "xai/" + "a" * 128]:
+        for value in ["openrouter/x-ai/grok-4.6", "openrouter/meta/llama-4:free", "groq/llama-4", "groq/openai/gpt-oss-120b", "deepseek/deepseek-chat", "mistral/mistral-large-latest", "xai/" + "a" * 128]:
             with self.subTest(value=value):
                 self.assertEqual(review.settings(inputs(model=value))["config.model"], value)
         for value in ['{}', 'null', 'false', '[3]', '[true]', '[[]]', '[""]', '["openai/a","openai/a"]', '["xai/grok-4.7"]', '["openai/a"]' * 2]:

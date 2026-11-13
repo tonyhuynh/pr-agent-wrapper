@@ -85,11 +85,15 @@ Under `pull_request`, GitHub withholds secrets from Dependabot PRs, so those run
 | `xai/` | `XAI_API_KEY` | `xai/grok-4.7` |
 | `openai/` | `OPENAI_API_KEY` | `openai/gpt-6.1-sol` |
 | `anthropic/` | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-5-5` |
-| `gemini/` | `GEMINI_API_KEY` | `gemini/<model>` |
+| `gemini/` | `GEMINI_API_KEY` | `gemini/gemini-2.5-pro` |
 | `openrouter/` | `OPENROUTER_API_KEY` | `openrouter/x-ai/grok-4.6` |
-| `groq/` | `GROQ_API_KEY` | `groq/<model>` |
-| `deepseek/` | `DEEPSEEK_API_KEY` | `deepseek/<model>` |
-| `mistral/` | `MISTRAL_API_KEY` | `mistral/<model>` |
+| `groq/` | `GROQ_API_KEY` | `groq/openai/gpt-oss-120b` |
+| `deepseek/` | `DEEPSEEK_API_KEY` | `deepseek/deepseek-chat` |
+| `mistral/` | `MISTRAL_API_KEY` | `mistral/mistral-large-latest` |
+
+The model part is the ID your provider uses in its own API, so look it up in the provider's model list. The examples above are IDs the pinned PR-Agent knows.
+
+PR-Agent also has to know the model's context size. It reads that from the version of LiteLLM it pins, and LiteLLM publishes its list at [models.litellm.ai](https://models.litellm.ai). That page shows the newest list, so a recent model can appear there and still be unknown here. For a model the pinned version does not know, set `custom_model_max_tokens` to its context size.
 
 Bedrock, Vertex AI, and Azure are not supported yet. They need more than one credential each.
 
