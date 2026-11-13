@@ -99,21 +99,24 @@ jobs:
           import tempfile
           import urllib.request
 
-          UPSTREAM = "efdde4afe14aa401a3889012c7f3e9ef3081a430"
+          UPSTREAM = "e673a02076ce09a4726c3d0c3cc85780e59ca52b"
           SOURCE_BLOBS = {
-              "docker/Dockerfile": "5eec5307216ba9c69f35a6a84c1759e64f313f17",
-              "pr_agent/cli.py": "3d50c83220853ac599a27aa89a582b009a01f645",
+              "docker/Dockerfile": "6c493a4ecb6ac5c7a53c7265e7afdeccbbd636bc",
+              "pr_agent/cli.py": "c23accc027abc76805511d02709ad62d3f5c3010",
               "pr_agent/config_loader.py": "873b2d3b09dfb9ee89c1b07a886da461c08642d1",
-              "pr_agent/custom_merge_loader.py": "b97952089c4da53423b9b967e7a6f160f33a0f9c",
-              "pr_agent/settings/configuration.toml": "011c0cdad1448ce102f99d983f4ddd0f5667f6cd",
-              "pr_agent/settings/ignore.toml": "314fd637aec658b537d93cee3a04f62035bc8ce8",
-              "pr_agent/algo/pr_processing.py": "2d081b7bdd62e432d8c9b5545496d8373be72e8d",
-              "pr_agent/algo/ai_handlers/litellm_ai_handler.py": "004359f8dc0e40c679c9803416cc91ca7771e71a",
-              "pr_agent/git_providers/plain_diff_provider.py": "40a8f2735de369eab1575ba69e6fe5dd1bb39af0",
-              "pr_agent/algo/run_output.py": "b22b60555f6889ea70448a6134458a7d877124bb",
-              "pr_agent/algo/run_details.py": "c3ef863b2d571d287fe9bfcabf864b56d1277458",
-              "pr_agent/tools/pr_reviewer.py": "4eeafc993de7f662e7090793ba81739c5e497d90",
-              "uv.lock": "5f67de304a16ea51a8532ecf775a166426774195",
+              "pr_agent/custom_merge_loader.py": "6517a1d858bff67c2ad48d793de87cdd5b8297ad",
+              "pr_agent/settings/configuration.toml": "59a91bd441365757bbf3ad5d3a487afb18d3d718",
+              "pr_agent/settings/ignore.toml": "938d7fb648260320975ee7f6a086328696c2ccbc",
+              "pr_agent/algo/pr_processing.py": "51c302a0dc2604e5a61c63aad8efbacbf22741fa",
+              "pr_agent/algo/ai_handlers/litellm_ai_handler.py": "05da9c02a6c11931ed685037165f50f9ead74f65",
+              "pr_agent/git_providers/plain_diff_provider.py": "4908670602d7723468e0c036ff41b5d8c0e6c8c3",
+              "pr_agent/algo/run_output.py": "7cb1600a505ea9a2e457734cb0ad996d9d8608a5",
+              "pr_agent/algo/run_details.py": "bd28076bdf2762c28b454168eae8108500a5f201",
+              "pr_agent/settings/i18n/en.toml": "2f7d6cb17af79df703c283e180179df710bb7c06",
+              "pr_agent/settings/i18n/es.toml": "307780e8f9a23ac29d587796908cec2cc3fc4bc8",
+              "pr_agent/algo/setting_utils.py": "450fc75ab1c2fca801cc493f60b1d60d649f0baf",
+              "pr_agent/tools/pr_reviewer.py": "8661343da20406d2b6150106eb3478b2abb0c1dc",
+              "uv.lock": "e1f05e7ae041d7b4a439fa4a4a516a14c7c94968",
           }
           IMAGE = "pr-agent-wrapper:local"
           MAX_DIFF = 4 * 1024 * 1024
@@ -514,16 +517,27 @@ jobs:
                   return "empty_output"
               text = data.decode("utf-8")
               require("\x00" not in text, "Invalid output")
-              chain = [config["config.model"], *config["config.fallback_models"]]
-              single = re.findall(r"^- Model: ([^\n\r]+)$", text, re.M)
-              merged = re.findall(r"^- Models: ([^\n\r]+)$", text, re.M)
-              expected = [m + (" (fallback)" if i else "") for i, m in enumerate(chain)]
-              known = len(single) == 1 and not merged and single[0] in expected
-              if config["pr_reviewer.enable_large_pr_chunking"] and len(merged) == 1 and not single:
-                  # A chunked review names every model that answered a chunk.
-                  names = merged[0].removesuffix(" (includes fallback)").split(", ")
-                  known = len(names) > 1 and len(set(names)) == len(names) and set(names) <= set(chain)
-              if "Agent run details" not in text or not known:
+              primary, fallbacks = config["config.model"], config["config.fallback_models"]
+              chain = [primary, *fallbacks]
+              # PR-Agent translates the footer labels, so match its shape and the model names, not its words:
+              # "- <label>: <model>", with a parenthesized note when a fallback answered.
+              named = []
+              for value in re.findall(r"^- [^:\n\r]{1,60}: ([^\n\r]+)$", text, re.M):
+                  names, note = value, ""
+                  if value.endswith(")") and " (" in value:
+                      names, note = value[:-1].rsplit(" (", 1)
+                  models = names.split(", ")
+                  if len(set(models)) == len(models) and set(models) <= set(chain):
+                      named.append((models, bool(note)))
+              known = False
+              if len(named) == 1:
+                  models, noted = named[0]
+                  if len(models) == 1:
+                      known = noted == (models[0] != primary)
+                  else:
+                      # A chunked review names every model that answered a chunk.
+                      known = config["pr_reviewer.enable_large_pr_chunking"]
+              if not known:
                   return "missing_model_details"
               return "oversized_output" if len(data) > COMMENT_LIMIT else "success"
 
@@ -672,7 +686,7 @@ jobs:
           import sys
           import urllib.request
 
-          UPSTREAM = "efdde4afe14aa401a3889012c7f3e9ef3081a430"
+          UPSTREAM = "e673a02076ce09a4726c3d0c3cc85780e59ca52b"
           STATUSES = {"success", "not_run", "key_validation_failed", "inference_failed", "empty_output", "oversized_output", "missing_model_details"}
           PROVIDERS = "xai|openai|anthropic|gemini|openrouter|groq|deepseek|mistral"
           MODEL = "(?:" + PROVIDERS + ")/[A-Za-z0-9][A-Za-z0-9._:/-]*"
@@ -740,8 +754,9 @@ jobs:
               text = review.decode("utf-8")
               require("\x00" not in text, "Invalid Markdown")
               if manifest["status"] == "success":
-                  require(text.strip() and len(review) <= 60000 and "Agent run details" in text
-                          and re.search(r"^- (Model: " + MODEL + r"( \(fallback\))?|Models: " + MODEL + "(, " + MODEL + r")+( \(includes fallback\))?)$", text, re.M), "Missing native output or model identity")
+                  # The footer labels follow the review language; the model names do not.
+                  require(text.strip() and len(review) <= 60000
+                          and re.search(r"^- [^:\n\r]{1,60}: " + MODEL + "(, " + MODEL + r")*( \([^()\n\r]{1,60}\))?$", text, re.M), "Missing native output or model identity")
               return manifest, text
 
 

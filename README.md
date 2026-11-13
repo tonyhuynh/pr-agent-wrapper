@@ -139,7 +139,7 @@ Only `model` is required.
 | `num_max_findings` | `3` | Most findings to report, 1 to 10 |
 | `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded |
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
-| `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR` |
+| `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR`. PR-Agent also translates the comment's fixed labels for the languages it ships, currently Spanish |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
 | `max_model_tokens` | `64000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000. PR-Agent's own default is 32000 |
 | `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
@@ -256,7 +256,7 @@ go install github.com/zricethezav/gitleaks/v8@v8.30.1
 
 `fetch_upstream.py` downloads a dozen pinned PR-Agent source files into `.test-upstream/` and verifies their hashes; the tests need them. To use files you already have, set `PRW_UPSTREAM_DIR` to their directory. The tests do not call a provider or publish to GitHub.
 
-The review job builds PR-Agent v0.49.0 from commit `efdde4afe14aa401a3889012c7f3e9ef3081a430`. To move the pin, run `.venv/bin/python scripts/bump_upstream.py v0.50.0`, read the upstream diff it links, delete `.test-upstream/`, and run the checks again. Dependabot proposes updates to the pinned actions.
+The review job builds PR-Agent v0.50.0 from commit `e673a02076ce09a4726c3d0c3cc85780e59ca52b`. To move the pin, run `.venv/bin/python scripts/bump_upstream.py v0.50.0`, read the upstream diff it links, delete `.test-upstream/`, and run the checks again. Dependabot proposes updates to the pinned actions.
 
 ## License
 

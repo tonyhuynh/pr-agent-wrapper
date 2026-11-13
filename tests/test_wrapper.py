@@ -281,7 +281,8 @@ class InputTests(unittest.TestCase):
                  ("- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "success"),
                  ("- Models: xai/grok-4.7, openai/other\n", "missing_model_details", "missing_model_details"),
                  ("- Models: xai/grok-4.7, xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
-                 ("- Models: xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
+                 ("- Models: xai/grok-4.7\n", "success", "success"), ("- Modelo: openai/a (respaldo)\n", "success", "success"),
+                 ("- Model: openai/a\n", "missing_model_details", "missing_model_details"), ("- Model: xai/grok-4.7 (fallback)\n", "missing_model_details", "missing_model_details"),
                  ("- Model: xai/grok-4.7\n- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "missing_model_details")]
         for footer, without, with_chunking in cases:
             with self.subTest(footer=footer):

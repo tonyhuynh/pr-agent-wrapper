@@ -4,4 +4,4 @@ Callers pin a full commit SHA, so every entry here is a change you opt into by m
 
 ## 0.1.0 (unreleased)
 
-Initial public release. Pins PR-Agent v0.49.0.
+Initial public release. Pins PR-Agent v0.50.0.
