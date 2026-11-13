@@ -15,6 +15,6 @@ jobs:
     uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
     with:
       model: xai/grok-4.7
-      extra_instructions: Focus on the workflow, package.json and docs.
+      extra_instructions: Focus on correctness and security. Skip style comments.
     secrets:
       XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
