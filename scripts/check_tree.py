@@ -20,7 +20,7 @@ def check():
                 assert re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}", action), action
     for kind in ("review", "publish"):
         compile(source(kind), str(ROOT / ".github/workflows/review.yml") + ":" + kind, "exec")
-    for path in [ROOT / "README.md", ROOT / "SECURITY.md", ROOT / "CHANGELOG.md", *ROOT.glob("docs/**/*.md")]:
+    for path in [ROOT / "README.md", ROOT / "SECURITY.md", ROOT / "CHANGELOG.md", ROOT / "CONTRIBUTING.md", *ROOT.glob("docs/**/*.md")]:
         text = path.read_text()
         assert "\u2014" not in text, path
         assert "\u2013" not in text, path
