@@ -6,8 +6,10 @@ from contextvars import ContextVar
 from contextlib import redirect_stderr
 import enum
 import json
+import math
 import io
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -17,9 +19,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from dynaconf import Dynaconf
-from tenacity import retry, retry_if_exception, stop_after_attempt
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
-from support import chains, functions, inputs, review, upstream
+from support import chains, functions, inputs, publisher, review, upstream
 
 
 class APIError(Exception): pass
@@ -169,13 +171,23 @@ class ConfigSemanticsTests(unittest.TestCase):
         self.assertIn("if there is no detectable .git root", plain.lower())
         calls = types.SimpleNamespace(model_used="openai/a", models_used=["openai/a"], fallback_used=True,
                                       has_token_usage=False, has_cache_usage=False, duration_seconds=1.0, num_ai_calls=1)
-        namespace = functions("pr_agent/algo/run_output.py", ["show_run_details"],
-                              {"get_run_details": lambda: calls,
-                               "get_settings": lambda: types.SimpleNamespace(get=lambda key, default=False: default)})
-        rendered = namespace["show_run_details"](False)
         config = review.settings(inputs(fallback_models='["openai/a"]'))
-        self.assertEqual(review.classify(rendered.encode(), config), "success")
-        self.assertIn("- Model: openai/a (fallback)", rendered)
+        chunked = review.settings(inputs(fallback_models='["openai/a"]', large_pr_chunking=True))
+        several = types.SimpleNamespace(**{**vars(calls), "models_used": ["xai/grok-4.7", "openai/a"]})
+        # PR-Agent translates the footer into each locale it ships; the wrapper must accept all of them.
+        for locale, single, merged in [("en", "- Model: openai/a (fallback)", "- Models: xai/grok-4.7, openai/a (includes fallback)"),
+                                       ("es", "- Modelo: openai/a (respaldo)", "- Modelos: xai/grok-4.7, openai/a (incluye respaldo)")]:
+            catalog = tomllib.loads(upstream("pr_agent/settings/i18n/" + locale + ".toml"))
+            for details, expected, settings in [(calls, single, config), (several, merged, chunked)]:
+                with self.subTest(locale=locale, expected=expected):
+                    namespace = functions("pr_agent/algo/run_output.py", ["show_run_details"],
+                                          {"get_run_details": lambda: details, "t": lambda key: catalog[key.split(".")[0]][key.split(".")[1]],
+                                           "get_settings": lambda: types.SimpleNamespace(get=lambda key, default=False: default)})
+                    rendered = namespace["show_run_details"](False)
+                    self.assertIn(expected, rendered)
+                    self.assertEqual(review.classify(rendered.encode(), settings), "success")
+                    self.assertTrue(re.search(r"^- [^:\n\r]{1,60}: " + publisher.MODEL + "(, " + publisher.MODEL + r")*( \([^()\n\r]{1,60}\))?$", rendered, re.M))
+        self.assertEqual(review.classify(rendered.encode(), config), "missing_model_details")
 
     def test_actual_cli_parser_accepts_the_runtime_arguments(self):
         tree = ast.parse(upstream("pr_agent/cli.py"))
@@ -186,7 +198,8 @@ class ConfigSemanticsTests(unittest.TestCase):
         # set_parser builds help text for all three commands before parsing review.
         namespace = {"argparse": argparse, "commands": ["review"], "DOCTOR_COMMANDS": [],
                      "COMMAND_DESCRIPTIONS": {"review": "Review", "describe": "Describe", "improve": "Improve"},
-                     "get_version": lambda: "0.49.0", "os": os}
+                     "get_version": lambda: "0.0.0", "os": os,
+                     "COMMAND_SPECS": {"review": types.SimpleNamespace(plain_diff_markdown=True, json_output="review")}}
         exec(compile(ast.Module(body=assignments, type_ignores=[]), "native-cli-constants", "exec"), namespace)
         functions("pr_agent/cli.py", ["set_parser", "_resolve_output_option", "_validate_output_options"], namespace)
         parser = namespace["set_parser"]()
@@ -216,9 +229,13 @@ class NativeFallbackTests(unittest.IsolatedAsyncioTestCase):
                                     "route_primary_model": lambda *args: None, "_effective_fallback_chain": self.context,
                                     "get_logger": lambda: Mock(), "record_model_used": lambda model, is_fallback: self.records.append((model, is_fallback))})
         self.handler = functions("pr_agent/algo/ai_handlers/litellm_ai_handler.py",
-                                 ["_as_bool", "_configured_client_retries", "_should_retry_same_model"],
+                                 ["_as_bool", "_configured_client_retries", "_should_retry_same_model", "_is_rejected_request",
+                                  "_retry_after_seconds", "_stop_same_model_retries", "_same_model_retry_wait"],
                                  {"openai": OPENAI, "EmptyTruncatedResponseError": EmptyTruncatedResponseError,
-                                  "get_settings": lambda: self.settings, "get_logger": lambda: Mock()})
+                                  "get_settings": lambda: self.settings, "get_logger": lambda: Mock(), "MAX_CONFIG_NUM_RETRIES": 10, "MODEL_RETRIES": 2,
+                                  "MidStreamFallbackError": FallbackEligibleError, "math": math, "wait_random_exponential": wait_random_exponential,
+                                  "httpx": types.SimpleNamespace(TransportError=ConnectionError, TimeoutException=TimeoutError),
+                                  **functions("pr_agent/algo/setting_utils.py", ["_as_bool_setting"], {})})
 
     async def asyncTearDown(self):
         self.scope.__exit__()
@@ -283,18 +300,21 @@ class NativeFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.handler["_configured_client_retries"](), 0)
         predicate = self.handler["_should_retry_same_model"]
         self.assertTrue(predicate(APIError()))
-        for error in [APITimeoutError, RateLimitError, BadRequestError, UnprocessableEntityError,
+        # A rate limit passes the predicate, but with num_retries pinned to 0 the stop rule ends it after one attempt.
+        self.assertTrue(predicate(RateLimitError()))
+        for error in [APITimeoutError, BadRequestError, UnprocessableEntityError,
                       AuthenticationError, PermissionDeniedError, EmptyTruncatedResponseError, ValueError]:
             self.assertFalse(predicate(error()), error)
         tree = ast.parse(upstream("pr_agent/algo/ai_handlers/litellm_ai_handler.py"))
         decorator = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_chat_completion_with_retry").decorator_list[0]
         constant = next(n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "MODEL_RETRIES" for t in n.targets))
         namespace = {"retry": retry, "retry_if_exception": retry_if_exception, "stop_after_attempt": stop_after_attempt,
-                     "_should_retry_same_model": predicate}
+                     "_should_retry_same_model": predicate, "_stop_same_model_retries": self.handler["_stop_same_model_retries"],
+                     "_same_model_retry_wait": self.handler["_same_model_retry_wait"]}
         exec(compile(ast.Module(body=[constant], type_ignores=[]), "native-retry-constant", "exec"), namespace)
         self.assertEqual(namespace["MODEL_RETRIES"], 2)
         decorate = eval(compile(ast.Expression(decorator), "native-retry-decorator", "eval"), namespace)
-        for error, expected_count in [(APIError, 2), (APITimeoutError, 1), (BadRequestError, 1)]:
+        for error, expected_count in [(APIError, 2), (APITimeoutError, 1), (BadRequestError, 1), (RateLimitError, 1)]:
             count = 0
             async def stub():
                 nonlocal count

@@ -55,12 +55,16 @@ class InputTests(unittest.TestCase):
         for value in ["Do not flag a missing @Override.", "Types come from @types/node; ask user@example.com.",
                       "Ignore @pytest.fixture and @formatter:off markers.", "Use @getter and @internal tags."]:
             with self.subTest(value=value):
-                self.assertEqual(review.settings(inputs(extra_instructions=value))["pr_reviewer.extra_instructions"], value)
+                self.assertEqual(review.settings(inputs(extra_instructions=value))["pr_reviewer.extra_instructions"], review.instructions(value, ["vendor/**"]))
         for value in ['["@str @jinja x"]', '["\\u0040jinja x"]']:
             with self.assertRaises(ValueError):
                 review.settings(inputs(ignore_globs=value))
         text = 'Focus on "the workflow", package.json and docs.\n$(touch /tmp/never) `uname` ${{ hostile }}'
-        self.assertEqual(review.settings(inputs(extra_instructions=text))["pr_reviewer.extra_instructions"], text)
+        self.assertEqual(review.settings(inputs(extra_instructions=text))["pr_reviewer.extra_instructions"], review.instructions(text, ["vendor/**"]))
+        # The model is told which files it cannot see, after the caller's own text.
+        note = 'Files matching these patterns were deliberately left out of this diff: ["vendor/**", "package-lock.json"]. Do not report them as missing, and do not report a missing change to them.'
+        self.assertEqual(review.settings(inputs(ignore_globs='["package-lock.json"]'))["pr_reviewer.extra_instructions"], note)
+        self.assertEqual(review.settings(inputs(ignore_globs='["package-lock.json"]', extra_instructions="Be brief."))["pr_reviewer.extra_instructions"], "Be brief.\n\n" + note)
         with self.assertRaises(ValueError):
             review.settings({**inputs(), "config.enable_auto_approval": True})
 
@@ -281,7 +285,8 @@ class InputTests(unittest.TestCase):
                  ("- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "success"),
                  ("- Models: xai/grok-4.7, openai/other\n", "missing_model_details", "missing_model_details"),
                  ("- Models: xai/grok-4.7, xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
-                 ("- Models: xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
+                 ("- Models: xai/grok-4.7\n", "success", "success"), ("- Modelo: openai/a (respaldo)\n", "success", "success"),
+                 ("- Model: openai/a\n", "missing_model_details", "missing_model_details"), ("- Model: xai/grok-4.7 (fallback)\n", "missing_model_details", "missing_model_details"),
                  ("- Model: xai/grok-4.7\n- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "missing_model_details")]
         for footer, without, with_chunking in cases:
             with self.subTest(footer=footer):
