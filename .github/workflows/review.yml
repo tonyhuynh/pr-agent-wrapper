@@ -303,6 +303,13 @@ jobs:
                   raise WrapperError("Invalid input `" + name + "`: " + str(error)) from None
 
 
+          def instructions(text, globs):
+              # The model cannot see ignored files. Say so, or it reports them as missing, such as a lockfile.
+              note = ("Files matching these patterns were deliberately left out of this diff: " + json.dumps(globs) +
+                      ". Do not report them as missing, and do not report a missing change to them.")
+              return text + "\n\n" + note if text.strip() else note
+
+
           def settings(inputs):
               require(set(inputs) == INPUT_NAMES, "Unexpected workflow inputs")
               primary = checked("model", model, inputs["model"])
@@ -316,7 +323,7 @@ jobs:
               globs = list(dict.fromkeys(["vendor/**", *globs]))
               checked("comment_mode", choice, inputs["comment_mode"], COMMENT_MODES)
               config = {**FIXED, "config.model": primary, "config.fallback_models": fallbacks,
-                        "pr_reviewer.extra_instructions": checked("extra_instructions", safe_text, inputs["extra_instructions"], 8192, True),
+                        "pr_reviewer.extra_instructions": instructions(checked("extra_instructions", safe_text, inputs["extra_instructions"], 8192, True), globs),
                         "pr_reviewer.num_max_findings": count, "ignore.glob": globs,
                         "config.ai_timeout": checked("ai_timeout", integer, inputs["ai_timeout"], 30, 540),
                         "config.max_model_tokens": checked("max_model_tokens", integer, inputs["max_model_tokens"], 4000, 2000000),

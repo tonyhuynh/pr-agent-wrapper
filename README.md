@@ -137,7 +137,7 @@ Only `model` is required.
 | `fallback_models` | `'[]'` | JSON array string of up to 4 more models; no duplicates, and not the primary |
 | `extra_instructions` | Empty | Text added to the review prompt, up to 8 KiB |
 | `num_max_findings` | `3` | Most findings to report, 1 to 10 |
-| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded |
+| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded. The review prompt names these patterns so the model does not report the hidden files as missing |
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
 | `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR`. PR-Agent also translates the comment's fixed labels for the languages it ships, currently Spanish |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
