@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -71,7 +72,7 @@ class InputTests(unittest.TestCase):
         config = review.settings(inputs(model="openai/local-model", api_base="https://llm.example.com:8443/v1", custom_model_max_tokens=128000,
                                         max_model_tokens=64000, reasoning_effort="high", response_language="pt-BR", ai_timeout=300, comment_mode="new"))
         self.assertEqual(config["openai.api_base"], "https://llm.example.com:8443/v1")
-        self.assertEqual(review.serialize(config)["OPENAI__API_BASE"], '@json "https://llm.example.com:8443/v1"')
+        self.assertEqual(review.serialize(config)["OPENAI__API_BASE"], '"https://llm.example.com:8443/v1"')
         self.assertEqual((config["config.custom_model_max_tokens"], config["config.max_model_tokens"], config["config.reasoning_effort"],
                           config["config.response_language"], config["config.ai_timeout"]), (128000, 64000, "high", "pt-BR", 300))
         self.assertNotIn("comment_mode", " ".join(config))
@@ -125,7 +126,7 @@ class InputTests(unittest.TestCase):
         self.assertEqual(covered, {native for _, native in review.KEYS.values()})
         config = review.settings(inputs(fallback_models='["openai/a","anthropic/b","gemini/c"]'))
         result = review.provider_keys(config, keys)
-        self.assertEqual(json.loads(result["GOOGLE_AI_STUDIO__GEMINI_API_KEY"][6:]), keys["GEMINI_API_KEY"])
+        self.assertEqual(tomllib.loads("key=" + result["GOOGLE_AI_STUDIO__GEMINI_API_KEY"])["key"], keys["GEMINI_API_KEY"])
         self.assertNotIn("OPENAI__KEY", review.provider_keys(review.settings(inputs()), keys))
         with self.assertRaises(ValueError):
             review.provider_keys(config, {**keys, "XAI_API_KEY": "@jinja x"})
@@ -194,7 +195,7 @@ class InputTests(unittest.TestCase):
                     run_timeouts.append(kwargs["timeout"])
                     starts.append(cmd)
                     self.assertEqual({name for name in kwargs["env"] if name in {key for _, key in review.KEYS.values()}}, {"XAI__KEY"})
-                    self.assertEqual(json.loads(kwargs["env"]["CONFIG__FALLBACK_MODELS"][6:]), [])
+                    self.assertEqual(tomllib.loads("key=" + kwargs["env"]["CONFIG__FALLBACK_MODELS"])["key"], [])
                     self.assertEqual(cmd[-1], "review")
                     (root / "output/review.md").write_bytes(native_markdown)
                 return subprocess.CompletedProcess(cmd, 0)
@@ -256,6 +257,15 @@ class InputTests(unittest.TestCase):
                 with patch.dict(os.environ, {"XAI_API_KEY": "stub-key"}, clear=True), patch.object(review.subprocess, "run", side_effect=runner):
                     with self.assertRaises(review.WrapperError) as raised: review.infer(root)
                 self.assertEqual(str(raised.exception), "Review failed: inference_failed" + suffix)
+
+    def test_settings_are_encoded_as_toml_literals(self):
+        for value in [True, False, 0, 32000, "", "xai/grok-4.7", 'quote " backslash \\ tab \t newline \n del \x7f', "caf\u00e9 \U0001f600 \u2028",
+                      [], ["vendor/**", "a b"], "true", "123", "[1]"]:
+            with self.subTest(value=value):
+                self.assertEqual(tomllib.loads("key=" + review.encode(value))["key"], value)
+                self.assertNotIn("\n", review.encode(value))
+        for value in [None, 1.5, {"a": 1}, ["a", {"b": 1}]]:
+            with self.assertRaises(ValueError): review.encode(value)
 
     def test_secret_diagnostic_accepts_only_known_names(self):
         self.assertEqual(set(review.SECRET_ERROR_MESSAGES), {public for public, _ in review.KEYS.values()})

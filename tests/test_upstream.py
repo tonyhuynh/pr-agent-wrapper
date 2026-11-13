@@ -42,7 +42,7 @@ class ModelType(enum.Enum):
     REASONING = 3
 
 
-def config_scope(config):
+def config_scope(config, extra_env=None):
     """Use the pinned loader, file defaults, and Dynaconf env loader together."""
     class Scope:
         def __enter__(self):
@@ -62,7 +62,7 @@ def config_scope(config):
             (root / "settings").mkdir()
             for name in ["configuration.toml", "ignore.toml"]:
                 (root / "settings" / name).write_text(upstream("pr_agent/settings/" + name))
-            self.env = patch.dict(os.environ, review.serialize(config), clear=True)
+            self.env = patch.dict(os.environ, {**review.serialize(config), **(extra_env or {})}, clear=True)
             self.env.start()
             namespace = {"__file__": str(root / "config_loader.py")}
             exec(compile(upstream("pr_agent/config_loader.py"), "config_loader.py", "exec"), namespace)
@@ -89,6 +89,18 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertEqual(settings.ignore.glob, ["vendor/**"])
                 self.assertEqual(settings.config.model, "xai/grok-4.7")
                 self.assertFalse(settings.config.get("use_repo_settings_file"))
+
+    def test_settings_keep_their_types_when_dynaconf_skips_converters(self):
+        # PR-Agent's logger reads settings mid-load; Dynaconf then skips "@" converters, as it does here.
+        config = review.settings(inputs(fallback_models='["openai/a"]', extra_instructions='say "hi"\nplease'))
+        with config_scope(config, {"AUTO_CAST_FOR_DYNACONF": "false"}) as settings:
+            for key, value in config.items():
+                self.assertEqual(settings.get(key), value, key)
+                self.assertIsInstance(settings.get(key), type(value), key)
+        keys = {"XAI_API_KEY": "test-only-xai", "OPENAI_API_KEY": "123"}
+        with patch.dict(os.environ, {**review.provider_keys(config, keys), "AUTO_CAST_FOR_DYNACONF": "false"}, clear=True):
+            settings = Dynaconf(envvar_prefix=False, load_dotenv=False, settings_files=[], merge_enabled=False)
+            self.assertEqual((settings.get("XAI.KEY"), settings.get("OPENAI.KEY")), ("test-only-xai", "123"))
 
     def test_key_mapping_real_env_loader(self):
         keys = {public: "test-only-" + provider for provider, (public, _) in review.KEYS.items()}

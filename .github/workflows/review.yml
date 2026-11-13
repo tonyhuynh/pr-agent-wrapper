@@ -148,7 +148,7 @@ jobs:
               "PR-Agent could not reach the model provider. Check provider availability and network access, then retry.":
                   "The runner could not reach the provider.",
               "Every configured model attempt failed. Check the PR-Agent service logs for the provider error, then retry.":
-                  "Every model in the chain failed without a recognized provider error. Check the model ID.",
+                  "Every model in the chain failed. Check the model ID and the API key.",
               "PR-Agent encountered an unexpected internal error. Check the PR-Agent service logs for details.":
                   "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`.",
           }
@@ -320,9 +320,21 @@ jobs:
               return config
 
 
+          def encode(value):
+              # A TOML literal. PR-Agent reads settings while they are still loading, and in that state
+              # Dynaconf skips "@" converters such as @json but still parses TOML.
+              if isinstance(value, bool):
+                  return "true" if value else "false"
+              if isinstance(value, int):
+                  return str(value)
+              if isinstance(value, str):
+                  return '"' + "".join(c if c >= " " and c not in '"\\\x7f' else "\\u%04x" % ord(c) for c in value) + '"'
+              require(isinstance(value, list), "Unsupported setting type")
+              return "[" + ", ".join(encode(item) for item in value) + "]"
+
+
           def serialize(config):
-              return {key.upper().replace(".", "__"): "@json " + json.dumps(value, ensure_ascii=True)
-                      for key, value in config.items()}
+              return {key.upper().replace(".", "__"): encode(value) for key, value in config.items()}
 
 
           SECRET_ERROR_MESSAGES = {
@@ -346,7 +358,7 @@ jobs:
                   if not isinstance(value, str) or not value.strip():
                       raise MissingProviderSecret(public)
                   safe_text(value, 8192)
-                  result[native] = "@json " + json.dumps(value)
+                  result[native] = encode(value)
               return result
 
 
