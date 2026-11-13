@@ -1,20 +1,20 @@
 # PR-Agent wrapper
 
-A reusable GitHub Actions workflow that reviews pull requests with [PR-Agent](https://github.com/The-PR-Agent/pr-agent) and an LLM you choose. It keeps the LLM key, the GitHub write token, and the PR's code in three separate jobs, so no single job can both read your key and write to your repository.
+A reusable GitHub Actions workflow that reviews pull requests with [PR-Agent](https://github.com/The-PR-Agent/pr-agent) and an LLM you choose. The LLM key and the GitHub write token live in separate jobs, so no job can both read your key and write to your repository.
 
-On each push to a PR it sends the diff to the model and writes the review as one PR comment, updated in place. It never approves, requests changes, labels, merges, or touches anyone else's comments.
+On each push to a PR, it sends the diff to the model and posts the review as one PR comment, updated in place. It never approves, requests changes, labels, merges, or touches anyone else's comments.
 
-## Should you use this or PR-Agent's own action
+## Should you use this or PR-Agent's own GitHub Action
 
-PR-Agent's action is simpler and does more: it reads the repository, answers comment commands, and can describe or improve a PR. Use it if that is what you want.
+The PR-Agent project publishes [its own GitHub Action](https://github.com/The-PR-Agent/pr-agent/blob/main/docs/docs/installation/github.md), which runs everything in one job. It is simpler to set up and does more. It reads the whole repository, answers commands in PR comments, and can write PR descriptions and code suggestions. Choose it when you need any of that.
 
-This wrapper trades those features for a smaller blast radius:
+This wrapper gives up those features to limit what a hostile PR can do:
 
-- No job holds both an LLM key and a GitHub token. A prompt injection in a diff can waste a review. It cannot push, comment, or read the repository.
+- No job holds both an LLM key and a GitHub token. A prompt injection in a diff can spoil that PR's review comment. It cannot push, approve, or read the rest of the repository.
 - The PR's code is never checked out or run, and PR-Agent ignores configuration files in the repository, so a PR cannot change how it is reviewed.
 - PR-Agent runs from a pinned commit with verified file hashes, in a container with no root, no writable filesystem, and no capabilities.
 
-The cost is context. The model sees the diff with three lines around each change, so it will miss problems that need the rest of the codebase. It also skips PRs from forks.
+The cost is context. The model sees the diff with three lines around each change, so it misses problems that need the rest of the codebase. PRs from forks are not reviewed.
 
 ## Set it up
 
@@ -24,7 +24,7 @@ The cost is context. The model sees the diff with three lines around each change
    gh secret set XAI_API_KEY
    ```
 
-2. **Pick a commit of this repository to pin.** Callers pin a full commit SHA, not a branch, so the workflow cannot change under you:
+2. **Get the commit SHA to pin.** A caller pins a full commit SHA, not a branch, so the workflow cannot change under you:
 
    ```sh
    gh api repos/tonyhuynh/pr-agent-wrapper/commits/main --jq .sha
@@ -50,16 +50,16 @@ The cost is context. The model sees the diff with three lines around each change
        uses: tonyhuynh/pr-agent-wrapper/.github/workflows/review.yml@<MAIN_SHA>
        with:
          model: xai/grok-4.7
-         extra_instructions: Focus on the workflow, package.json and docs.
+         extra_instructions: Focus on correctness and security. Skip style comments.
        secrets:
          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
    ```
 
 4. **Merge that file to your default branch, then open a PR.** Three jobs run: `capture`, `review`, and `publish`. When they finish, a comment from `github-actions[bot]` appears on the PR. Later pushes update the same comment.
 
-What the pieces of the caller do:
+In that file:
 
-- `pull-requests: write` lets the `publish` job write the comment. Nothing else gets that permission.
+- `pull-requests: write` lets the `publish` job write the comment. No other job gets that permission.
 - `secrets:` passes only the keys your models need. Do not use `secrets: inherit`.
 - `concurrency` cancels a running review when a new push arrives, so you pay for one review per burst of pushes.
 
@@ -67,7 +67,7 @@ Do not make the review a required check. A provider outage would then block ever
 
 ### Which trigger
 
-The workflow accepts both PR triggers. It runs on opened, reopened, synchronize, and ready-for-review, and skips drafts, forks, and closed PRs under either one.
+The workflow runs under either PR trigger when a PR is opened, reopened, pushed to, or marked ready for review. It skips drafts, forks, and closed PRs.
 
 | Trigger | Caller file is read from | Choose it when |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ Under `pull_request`, GitHub withholds secrets from Dependabot PRs, so those run
 
 ## Models and providers
 
-`model` is required and has the form `<provider>/<model>`, where the model part is the provider's own model ID. There is no default, because a default model goes stale and then breaks every caller pinned to it.
+`model` is required and has the form `<provider>/<model>`. The model part is the ID the provider uses in its own API, so look it up in the provider's model list. There is no default, because a default model goes stale and then breaks every caller pinned to it.
 
 | Provider prefix | Secret to pass | Example |
 | --- | --- | --- |
@@ -91,11 +91,9 @@ Under `pull_request`, GitHub withholds secrets from Dependabot PRs, so those run
 | `deepseek/` | `DEEPSEEK_API_KEY` | `deepseek/deepseek-chat` |
 | `mistral/` | `MISTRAL_API_KEY` | `mistral/mistral-large-latest` |
 
-The model part is the ID your provider uses in its own API, so look it up in the provider's model list. The examples above are IDs the pinned PR-Agent knows.
+PR-Agent also has to know the model's context size. It reads that from the version of LiteLLM it pins, which knows every example above. LiteLLM publishes its list at [models.litellm.ai](https://models.litellm.ai), but that page shows the newest list, so a recent model can appear there and still be unknown here. For a model the pinned version does not know, set `custom_model_max_tokens` to its context size. Without it, the review fails with `inference_failed`.
 
-PR-Agent also has to know the model's context size. It reads that from the version of LiteLLM it pins, and LiteLLM publishes its list at [models.litellm.ai](https://models.litellm.ai). That page shows the newest list, so a recent model can appear there and still be unknown here. For a model the pinned version does not know, set `custom_model_max_tokens` to its context size.
-
-Bedrock, Vertex AI, and Azure are not supported yet. They need more than one credential each.
+Bedrock, Vertex AI, and Azure are not supported yet, because each needs more than one credential.
 
 ### Fallback models
 
@@ -125,7 +123,7 @@ Any service that speaks the OpenAI API, including one you host, works through `a
       OPENAI_API_KEY: ${{ secrets.MY_LLM_KEY }}
 ```
 
-`custom_model_max_tokens` tells PR-Agent the model's context size. You need it whenever the pinned PR-Agent does not know the model, which includes models released after the pinned version. Without it, the review fails with `inference_failed`.
+Set `custom_model_max_tokens` too, because PR-Agent cannot know the context size of a model you name yourself.
 
 ## Inputs
 
@@ -137,7 +135,7 @@ Only `model` is required.
 | `fallback_models` | `'[]'` | JSON array string of up to 4 more models; no duplicates, and not the primary |
 | `extra_instructions` | Empty | Text added to the review prompt, up to 8 KiB |
 | `num_max_findings` | `3` | Most findings to report, 1 to 10 |
-| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded. The review prompt names these patterns so the model does not report the hidden files as missing |
+| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded. The prompt tells the model these files were left out, so it does not report them as missing |
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
 | `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR`. PR-Agent also translates the comment's fixed labels for the languages it ships, currently Spanish |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
@@ -155,7 +153,7 @@ Text inputs cannot start with an at sign or contain a Dynaconf directive such as
 - **Pushes during a review.** If the PR moved while a review was running, the comment says so and still names the commits it covers. If a newer run already reviewed the newer head, the older run writes nothing.
 - **Failures stay off the PR.** A failed review fails the job and writes the reason to the job summary. The last good review stays in place.
 - **A run takes about two minutes.** Each run builds PR-Agent from source, which is about one minute of that.
-- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. Each review of a large PR then costs more and takes longer, so you may need a higher `ai_timeout` too. For a diff that outgrows even that, or a model with a small context, set `large_pr_chunking: true`. PR-Agent then reviews the diff in up to 3 slices and merges the results. That costs up to 3 calls, and an issue that spans two slices can be missed.
+- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. The review then costs more and takes longer, so it may need a higher `ai_timeout` too. If the diff still does not fit, or the model's context is small, set `large_pr_chunking: true`. PR-Agent then reviews the diff in up to 3 model calls and merges the results. It can miss an issue that spans two of them.
 - **Your provider sees the diff.** The diff and review are also kept as workflow artifacts for 3 days. See [SECURITY.md](SECURITY.md) before using this on code that must not leave the repository.
 
 ### Example comment
@@ -198,7 +196,7 @@ Open the failed run. Errors appear as an annotation titled "PR-Agent wrapper", a
 
 | What you see | Cause | Fix |
 | --- | --- | --- |
-| All three jobs skipped | The PR is a draft, comes from a fork, or the event is not one of the four supported actions | Mark the PR ready for review. Fork PRs are not reviewed |
+| All three jobs skipped | The PR is a draft, comes from a fork, or the event is not one of the four supported types | Mark the PR ready for review. Fork PRs are not reviewed |
 | ``Invalid input `name`: ...`` in `capture` | An input broke the rule named in the message. The value is never printed | Fix that input; the [Inputs](#inputs) table has the limits |
 | `Review failed: key_validation_failed` | A provider in your chain has no key, or the caller did not pass it under `secrets:`. The `review` job log names it: `Missing required workflow secret: NAME` | Add the secret to the repository and pass it in the caller |
 | `Review failed: inference_failed` | PR-Agent could not produce a review. When PR-Agent recognizes the cause (rejected key, no credits, rate limit, timeout, context limit, unreachable provider), the message ends with it | Follow the reason. With no reason, check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
@@ -254,9 +252,11 @@ go install github.com/zricethezav/gitleaks/v8@v8.30.1
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-`fetch_upstream.py` downloads a dozen pinned PR-Agent source files into `.test-upstream/` and verifies their hashes; the tests need them. To use files you already have, set `PRW_UPSTREAM_DIR` to their directory. The tests do not call a provider or publish to GitHub.
+`fetch_upstream.py` downloads the pinned PR-Agent source files the tests need into `.test-upstream/` and verifies their hashes. To use files you already have, set `PRW_UPSTREAM_DIR` to their directory. The tests do not call a provider or publish to GitHub.
 
-The review job builds PR-Agent v0.50.0 from commit `e673a02076ce09a4726c3d0c3cc85780e59ca52b`. To move the pin, run `.venv/bin/python scripts/bump_upstream.py v0.50.0`, read the upstream diff it links, delete `.test-upstream/`, and run the checks again. Dependabot proposes updates to the pinned actions.
+The review job builds PR-Agent v0.50.0 from commit `e673a02076ce09a4726c3d0c3cc85780e59ca52b`. To move the pin, run `.venv/bin/python scripts/bump_upstream.py <tag>` with the new release tag, read the upstream diff it links, delete `.test-upstream/`, and run the checks again. Dependabot proposes updates to the GitHub Actions the workflows pin.
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers what a pull request needs.
 
 ## License
 
