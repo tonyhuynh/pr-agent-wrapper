@@ -192,7 +192,7 @@ class InputTests(unittest.TestCase):
             self.assertEqual(config["config.fallback_models"], [])
             (root / "config.json").write_text(json.dumps(config))
             artifact(root / "artifact")
-            native_markdown = b"Native review\nAgent run details\n- Model: xai/grok-4.7\n"
+            native_markdown = b"Native review\n\xe2\x9a\x99\xef\xb8\x8f Agent run details\n- Model: xai/grok-4.7\n"
             starts = []
             run_timeouts = []
             def runner(cmd, **kwargs):
@@ -279,7 +279,7 @@ class InputTests(unittest.TestCase):
         chunked = review.settings(inputs(fallback_models='["openai/a"]', large_pr_chunking=True))
         self.assertEqual((plain["pr_reviewer.enable_large_pr_chunking"], chunked["pr_reviewer.enable_large_pr_chunking"]), (False, True))
         self.assertEqual(chunked["pr_reviewer.max_number_of_calls"], 3)
-        body = "Review\n\nAgent run details\n"
+        body = "Review\n\n\u2699\ufe0f Agent run details\n"
         cases = [("- Model: xai/grok-4.7\n", "success", "success"), ("- Model: openai/a (fallback)\n", "success", "success"),
                  ("- Models: xai/grok-4.7, openai/a (includes fallback)\n", "missing_model_details", "success"),
                  ("- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "success"),
@@ -287,7 +287,7 @@ class InputTests(unittest.TestCase):
                  ("- Models: xai/grok-4.7, xai/grok-4.7\n", "missing_model_details", "missing_model_details"),
                  ("- Models: xai/grok-4.7\n", "success", "success"), ("- Modelo: openai/a (respaldo)\n", "success", "success"),
                  ("- Model: openai/a\n", "missing_model_details", "missing_model_details"), ("- Model: xai/grok-4.7 (fallback)\n", "missing_model_details", "missing_model_details"),
-                 ("- Model: xai/grok-4.7\n- Models: xai/grok-4.7, openai/a\n", "missing_model_details", "missing_model_details")]
+                 ("- Tokens: 1 in\n- Model: xai/grok-4.7\n", "missing_model_details", "missing_model_details")]
         for footer, without, with_chunking in cases:
             with self.subTest(footer=footer):
                 self.assertEqual(review.classify((body + footer).encode(), plain), without)
@@ -299,7 +299,7 @@ class InputTests(unittest.TestCase):
             review.MissingProviderSecret("untrusted text\n::error::hostile")
 
     def test_mocked_container_output_never_uploads_a_secret(self):
-        footer = b"\nAgent run details\n- Model: xai/grok-4.7\n"
+        footer = b"\n\xe2\x9a\x99\xef\xb8\x8f Agent run details\n- Model: xai/grok-4.7\n"
         for payload, expected_status in [(b"review" + footer, "success"), (b"", "empty_output"),
                                          (b"x" * 60001 + footer, "oversized_output"),
                                          (b"stub-key" + footer, "inference_failed"),
@@ -350,7 +350,7 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(json.loads(outputs["providers"]), ["xai"])
             keyed_root = temp / "review"
             shutil.copytree(capture_root, keyed_root)
-            native = b"Native review\nAgent run details\n- Model: xai/grok-4.7\n"
+            native = b"Native review\n\xe2\x9a\x99\xef\xb8\x8f Agent run details\n- Model: xai/grok-4.7\n"
             def runner(cmd, **kwargs):
                 if cmd[1] == "run":
                     (keyed_root / "output/review.md").write_bytes(native)
@@ -511,7 +511,7 @@ class PublishTests(unittest.TestCase):
             self.assertIn("PR advanced", client.comments[0][2])
 
     def test_new_comment_with_exact_native_markdown(self):
-        native = 'Review `$(anything)`\n<script>never evaluated</script>\n\nAgent run details\n- Model: openai/a (fallback)\n'
+        native = 'Review `$(anything)`\n<script>never evaluated</script>\n\n\u2699\ufe0f Agent run details\n- Model: openai/a (fallback)\n'
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             meta = artifact(root, native)
@@ -588,9 +588,26 @@ class PublishTests(unittest.TestCase):
             with self.assertRaises(ValueError): publisher.publish(root, meta, client)
             self.assertFalse(client.comments)
 
+    def test_only_the_final_run_details_block_names_the_model(self):
+        config = review.settings(inputs())
+        footer = "\n\u2699\ufe0f Agent run details\n\n- Model: xai/grok-4.7\n- Tokens: 1 in\n\n</details>\n"
+        cases = [("Review\n- Provider: xai/grok-4.7\n" + footer, True),
+                 ("Review\n\u2699 Settings\n- Provider: openai/other\n" + footer, True),
+                 ("Review\n- Recommendation: xai/grok-4.7\nmore text\n", False),
+                 ("Review\n" + footer + "\n\u2699 Late block\n- Provider: not a model\n", False),
+                 ("Review\n\u2699\ufe0f Agent run details\n- Tokens: 1 in\n- Model: xai/grok-4.7\n", False)]
+        for text, genuine in cases:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(review.classify(text.encode(), config), "success" if genuine else "missing_model_details")
+                meta = artifact(Path(directory), text)
+                if genuine:
+                    publisher.validate(Path(directory), meta)
+                else:
+                    with self.assertRaises(ValueError): publisher.validate(Path(directory), meta)
+
     def test_failures_and_limits_are_explicit(self):
         config = review.settings(inputs())
-        footer = "\nAgent run details\n- Model: xai/grok-4.7\n"
+        footer = "\n\u2699\ufe0f Agent run details\n- Model: xai/grok-4.7\n"
         self.assertEqual(review.classify(b"", config), "empty_output")
         self.assertEqual(review.classify(b"no footer", config), "missing_model_details")
         self.assertEqual(review.classify(("x" * 60001 + footer).encode(), config), "oversized_output")
@@ -628,7 +645,7 @@ class PublishTests(unittest.TestCase):
             self.assertFalse(client.comments)
 
     def test_openrouter_footer_is_publishable(self):
-        native = "Review\n\nAgent run details\n- Model: openrouter/x-ai/grok-4.6:free (fallback)\n"
+        native = "Review\n\n\u2699\ufe0f Agent run details\n- Model: openrouter/x-ai/grok-4.6:free (fallback)\n"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             meta = artifact(root, native)

@@ -526,10 +526,16 @@ jobs:
               require("\x00" not in text, "Invalid output")
               primary, fallbacks = config["config.model"], config["config.fallback_models"]
               chain = [primary, *fallbacks]
-              # PR-Agent translates the footer labels, so match its shape and the model names, not its words:
-              # "- <label>: <model>", with a parenthesized note when a fallback answered.
+              # PR-Agent ends its output with a gear-marked run-details block whose first bullet names the model.
+              # It translates the labels, so match the block's position and shape and the model names, not its words:
+              # "- <label>: <model>", with a parenthesized note when a fallback answered. Bullets in the review body
+              # come before the last gear and are ignored, so the reviewed diff cannot forge or duplicate the line.
               named = []
-              for value in re.findall(r"^- [^:\n\r]{1,60}: ([^\n\r]+)$", text, re.M):
+              _, gear, tail = text.rpartition("\u2699")
+              first = re.search(r"^- [^\n\r]*$", tail, re.M) if gear else None
+              match = re.fullmatch(r"- [^:\n\r]{1,60}: ([^\n\r]+)", first.group(0)) if first else None
+              if match:
+                  value = match.group(1)
                   names, note = value, ""
                   if value.endswith(")") and " (" in value:
                       names, note = value[:-1].rsplit(" (", 1)
@@ -762,8 +768,11 @@ jobs:
               require("\x00" not in text, "Invalid Markdown")
               if manifest["status"] == "success":
                   # The footer labels follow the review language; the model names do not.
-                  require(text.strip() and len(review) <= 60000
-                          and re.search(r"^- [^:\n\r]{1,60}: " + MODEL + "(, " + MODEL + r")*( \([^()\n\r]{1,60}\))?$", text, re.M), "Missing native output or model identity")
+                  # The first bullet after the last gear mark is PR-Agent's own model line; bullets in the body are ignored.
+                  _, gear, tail = text.rpartition("\u2699")
+                  first = re.search(r"^- [^\n\r]*$", tail, re.M) if gear else None
+                  require(text.strip() and len(review) <= 60000 and first
+                          and re.fullmatch(r"- [^:\n\r]{1,60}: " + MODEL + "(, " + MODEL + r")*( \([^()\n\r]{1,60}\))?", first.group(0)), "Missing native output or model identity")
               return manifest, text
 
 

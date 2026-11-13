@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 from dynaconf import Dynaconf
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_exponential
 
-from support import chains, functions, inputs, publisher, review, upstream
+from support import artifact, chains, functions, inputs, publisher, review, upstream
 
 
 class APIError(Exception): pass
@@ -183,10 +183,12 @@ class ConfigSemanticsTests(unittest.TestCase):
                     namespace = functions("pr_agent/algo/run_output.py", ["show_run_details"],
                                           {"get_run_details": lambda: details, "t": lambda key: catalog[key.split(".")[0]][key.split(".")[1]],
                                            "get_settings": lambda: types.SimpleNamespace(get=lambda key, default=False: default)})
-                    rendered = namespace["show_run_details"](False)
-                    self.assertIn(expected, rendered)
-                    self.assertEqual(review.classify(rendered.encode(), settings), "success")
-                    self.assertTrue(re.search(r"^- [^:\n\r]{1,60}: " + publisher.MODEL + "(, " + publisher.MODEL + r")*( \([^()\n\r]{1,60}\))?$", rendered, re.M))
+                    for gfm in (False, True):
+                        rendered = "Review\n- Provider: openai/a\n" + namespace["show_run_details"](gfm)
+                        self.assertIn(expected, rendered)
+                        self.assertEqual(review.classify(rendered.encode(), settings), "success")
+                        with tempfile.TemporaryDirectory() as directory:
+                            publisher.validate(Path(directory), artifact(Path(directory), rendered))
         self.assertEqual(review.classify(rendered.encode(), config), "missing_model_details")
 
     def test_actual_cli_parser_accepts_the_runtime_arguments(self):

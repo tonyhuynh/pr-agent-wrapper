@@ -44,7 +44,7 @@ def expected():
     return publisher.expected_identity(event(), env)
 
 
-def artifact(root, text="Native review\n\nAgent run details\n- Model: xai/grok-4.7\n", status="success"):
+def artifact(root, text="Native review\n\n\u2699\ufe0f Agent run details\n- Model: xai/grok-4.7\n", status="success"):
     for name in ("manifest.json", "review.diff", "review.md"):
         (root / name).unlink(missing_ok=True)
     meta = expected()
