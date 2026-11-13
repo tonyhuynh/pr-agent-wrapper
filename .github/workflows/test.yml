@@ -17,8 +17,8 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install -r requirements-test.txt
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
-          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
       - name: Validate workflows
         run: |
           "$(go env GOPATH)/bin/actionlint"

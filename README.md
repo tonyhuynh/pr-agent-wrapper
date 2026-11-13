@@ -243,8 +243,8 @@ The checks need Python 3.11 or newer and Go (for `actionlint` and `gitleaks`). T
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-test.txt
-go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
-go install github.com/zricethezav/gitleaks/v8@v8.24.3
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+go install github.com/zricethezav/gitleaks/v8@v8.30.1
 "$(go env GOPATH)/bin/actionlint"
 .venv/bin/yamllint -d '{extends: relaxed, rules: {line-length: disable, truthy: disable}}' .github/workflows examples
 .venv/bin/python scripts/check_tree.py
