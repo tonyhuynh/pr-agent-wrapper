@@ -34,7 +34,7 @@ on:
         default: en-US
       ai_timeout:
         type: number
-        default: 120
+        default: 300
       comment_mode:
         type: string
         default: update
@@ -77,6 +77,7 @@ jobs:
       providers: ${{ steps.capture.outputs.providers }}
       merge_base: ${{ steps.capture.outputs.merge_base }}
       diff_sha256: ${{ steps.capture.outputs.diff_sha256 }}
+      run_attempt: ${{ steps.capture.outputs.run_attempt }}
     steps:
       - name: Capture diff and save runtime
         id: capture
@@ -87,6 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/prw-runtime.py" <<'PRW_REVIEW_PY'
+          import fnmatch
           import hashlib
           import json
           import os
@@ -107,6 +109,7 @@ jobs:
               "pr_agent/custom_merge_loader.py": "6517a1d858bff67c2ad48d793de87cdd5b8297ad",
               "pr_agent/settings/configuration.toml": "59a91bd441365757bbf3ad5d3a487afb18d3d718",
               "pr_agent/settings/ignore.toml": "938d7fb648260320975ee7f6a086328696c2ccbc",
+              "pr_agent/algo/file_filter.py": "2096bb957502427541a7715b3fe3147966374082",
               "pr_agent/algo/pr_processing.py": "51c302a0dc2604e5a61c63aad8efbacbf22741fa",
               "pr_agent/algo/ai_handlers/cloud_auth.py": "d1bba80193204e64e56155f8d26e904a4864602d",  # gitleaks:allow (a public Git blob ID; the path contains "auth")
               "pr_agent/algo/ai_handlers/litellm_ai_handler.py": "05da9c02a6c11931ed685037165f50f9ead74f65",
@@ -142,24 +145,26 @@ jobs:
           COMMENT_MODES = {"update", "new"}
           # Model calls PR-Agent may make for one review when large_pr_chunking is on.
           CHUNK_CALLS = 3
+          # Never reviewed, whatever the caller passes. PR-Agent already skips *.lock by extension.
+          ALWAYS_IGNORED = ["vendor/**", "**/package-lock.json", "**/npm-shrinkwrap.json", "**/pnpm-lock.yaml", "**/go.sum"]
           # PR-Agent's own fixed failure reasons, each mapped to wording from this file. Nothing else is ever shown.
           FAILURE_REASONS = {
               "The model provider rejected the request because the API account has insufficient credits. Add credits, then retry the command.":
-                  "The provider says the account has insufficient credits.",
+                  ("credits", "The provider says the account has insufficient credits."),
               "PR-Agent could not authenticate with the model provider. Check the configured API credentials, then retry.":
-                  "The provider rejected the API key.",
+                  ("auth", "The provider rejected the API key."),
               "The model provider rate-limited the request. Wait for the limit to reset, then retry.":
-                  "The provider rate-limited the request.",
+                  ("rate_limit", "The provider rate-limited the request."),
               "The model provider timed out before completing the review. Retry the command or adjust the provider timeout.":
-                  "The provider timed out. Retry, or raise `ai_timeout`.",
+                  ("timeout", "The provider timed out. Raise `ai_timeout`, lower `reasoning_effort`, or add a fallback model. For a large diff, leave files out with `ignore_globs`; the capture job's summary lists the largest files."),
               "The pull request exceeded the selected model's context limit. Retry with a larger-context model or an incremental review.":
-                  "The diff exceeds the model's context limit. Lower `max_model_tokens` or pick a larger model.",
+                  ("context", "The diff exceeds the model's context limit. Lower `max_model_tokens` or pick a larger model."),
               "PR-Agent could not reach the model provider. Check provider availability and network access, then retry.":
-                  "The runner could not reach the provider.",
+                  ("unreachable", "The runner could not reach the provider."),
               "Every configured model attempt failed. Check the PR-Agent service logs for the provider error, then retry.":
-                  "Every model in the chain failed. Check the model ID and the API key.",
+                  ("all_failed", "Every model in the chain failed. Check the model ID and the API key."),
               "PR-Agent encountered an unexpected internal error. Check the PR-Agent service logs for details.":
-                  "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`.",
+                  ("internal", "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`."),
           }
           # Dynaconf converter tokens. A value that starts with one is evaluated, not read.
           DIRECTIVES = ("bool|capitalize|casefold|comment|del|empty|float|format|get|insert|int|jinja|json|lower|lstrip|"
@@ -326,8 +331,7 @@ jobs:
               checked("fallback_models", require, primary not in fallbacks, "must not repeat the primary model")
               count = checked("num_max_findings", integer, inputs["num_max_findings"], 1, 10)
               globs = checked("ignore_globs", array_text, inputs["ignore_globs"], 32, 256)
-              # Keep the native vendor exclusion even when callers add patterns.
-              globs = list(dict.fromkeys(["vendor/**", *globs]))
+              globs = list(dict.fromkeys([*ALWAYS_IGNORED, *globs]))
               checked("comment_mode", choice, inputs["comment_mode"], COMMENT_MODES)
               config = {**FIXED, "config.model": primary, "config.fallback_models": fallbacks,
                         "pr_reviewer.extra_instructions": instructions(checked("extra_instructions", safe_text, inputs["extra_instructions"], 8192, True), globs),
@@ -454,6 +458,84 @@ jobs:
               return merge_base, patch
 
 
+          def globstars(pattern):
+              # Offsets of whole "**/" segments outside bracket expressions, as PR-Agent finds them.
+              offsets, index, last_close = [], 0, pattern.rfind("]")
+              while index < len(pattern):
+                  if pattern[index] == "[":
+                      end = index + 1
+                      if pattern[end:end + 1] == "!":
+                          end += 1
+                      end += 1
+                      if end <= last_close:
+                          while pattern[end] != "]":
+                              end += 1
+                          index = end + 1
+                      else:
+                          index += 1
+                  elif pattern.startswith("**/", index) and (index == 0 or pattern[index - 1] == "/"):
+                      offsets.append(index)
+                      index += 3
+                  else:
+                      index += 1
+              return offsets
+
+
+          def ignore_patterns(globs):
+              # The pinned PR-Agent's glob rule, used here only to report what it will leave out: fnmatch,
+              # where "*" crosses "/" and each "**/" segment may also match no directory.
+              regexes, expandable = {}, []
+              for pattern in dict.fromkeys(globs):
+                  for form in ([pattern, pattern[3:]] if pattern.startswith("**/") else [pattern]):
+                      if form:
+                          regexes[fnmatch.translate(form)] = None
+                  offsets = globstars(pattern)
+                  if offsets and len(offsets) <= 6 and len(pattern) <= 256:
+                      expandable.append((pattern.split("/"), [pattern[:offset].count("/") for offset in offsets]))
+              variants = 0
+              for segments, stars in expandable:
+                  for mask in range(1, 1 << len(stars)):
+                      dropped = {index for bit, index in enumerate(stars) if mask >> bit & 1}
+                      variant = "/".join(segment for index, segment in enumerate(segments) if index not in dropped)
+                      translation = fnmatch.translate(variant) if variant else None
+                      if not variant or translation in regexes:
+                          continue
+                      if variants >= 256:
+                          break
+                      regexes[translation] = None
+                      variants += 1
+              return [re.compile(regex) for regex in regexes]
+
+
+          def diff_summary(patch, globs, count=5):
+              # Sizes of the captured diff and of what `ignore_globs` leaves out, to help the caller tune it.
+              patterns = ignore_patterns(globs)
+              sent, left = [], []
+              for part in re.split(rb"(?m)^(?=diff --git )", patch):
+                  head = part.split(b"\n", 1)[0].decode("utf-8", "replace")
+                  if not head.startswith("diff --git "):
+                      continue
+                  rest = head[len("diff --git "):]
+                  name = rest[2:2 + (len(rest) - 5) // 2]
+                  known = rest == "a/" + name + " b/" + name
+                  # Paths come from the PR. Show only plain ones, so a path cannot add markup to the summary.
+                  plain = known and re.fullmatch(r"[A-Za-z0-9._/@+\[\]()~,= -]{1,200}", name)
+                  ignored = known and any(pattern.match(name) for pattern in patterns)
+                  (left if ignored else sent).append((len(part), "`" + name + "`" if plain else "(path not shown)"))
+              kib = lambda size: str(max(1, round(size / 1024))) + " KiB"
+              total = lambda rows: str(len(rows)) + " file(s), " + kib(sum(size for size, _ in rows))
+              lines = ["### PR-Agent review input", "", "Captured diff: " + total(sent + left) + ". The run's artifact holds all of it.", ""]
+              if left:
+                  lines += ["`ignore_globs` and the built-in exclusions leave out " + total(left) + ". "
+                            "PR-Agent receives " + total(sent) + ", and also skips binary and `.lock` files.", ""]
+              for title, rows in (("Largest files sent", sent), ("Largest files left out", left)):
+                  if rows:
+                      lines += ["| " + title + " | Diff size |", "| --- | --- |"]
+                      lines += ["| " + name + " | " + kib(size) + " |" for size, name in sorted(rows, key=lambda item: -item[0])[:count]]
+                      lines.append("")
+              return "\n".join(lines)
+
+
           def prepare(root):
               root.mkdir()
               config = settings(json.loads(os.environ["INPUTS_JSON"]))
@@ -463,8 +545,11 @@ jobs:
                   require(re.fullmatch(r"[1-9][0-9]*", value), "Invalid run identity")
                   meta[key] = value
               merge_base, patch = git_diff(meta, root, os.environ.get("GH_READ_TOKEN", ""))
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write(diff_summary(patch, config["ignore.glob"]))
               meta.update({"schema": 1, "upstream": UPSTREAM, "merge_base": merge_base, "diff_sha256": digest(patch),
-                           "status": "not_run", "review_sha256": digest(b"")})
+                           "status": "not_run", "reason": "", "review_sha256": digest(b"")})
               (root / "input").mkdir()
               (root / "artifact").mkdir()
               (root / "output").mkdir(mode=0o777)
@@ -477,7 +562,7 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   providers = sorted({m.split("/", 1)[0] for m in [config["config.model"], *config["config.fallback_models"]]})
                   f.write("providers=" + json.dumps(providers) + "\n")
-                  f.write(f"captured=true\nmerge_base={merge_base}\ndiff_sha256={meta['diff_sha256']}\n")
+                  f.write(f"captured=true\nmerge_base={merge_base}\ndiff_sha256={meta['diff_sha256']}\nrun_attempt={meta['run_attempt']}\n")
 
 
           def build(root):
@@ -563,11 +648,12 @@ jobs:
 
 
           def failure_reason(data):
-              # Exact match against PR-Agent's fixed reasons, so provider text can never reach the log.
-              for upstream, message in FAILURE_REASONS.items():
+              # Exact match against PR-Agent's fixed reasons, so provider text can never reach the log or the PR.
+              # Returns a code for the manifest and this file's own wording for the annotation.
+              for upstream, (code, message) in FAILURE_REASONS.items():
                   if data.strip() == ("Failed to review PR\n\n**Reason:** " + upstream).encode():
-                      return ". " + message
-              return ""
+                      return code, ". " + message
+              return "", ""
 
 
           def infer(root):
@@ -612,9 +698,10 @@ jobs:
                   # Provider errors and output may contain credentials. Keep them out of logs.
                   data = b""
               (root / "artifact/review.md").write_bytes(data)
-              meta.update(status=status, review_sha256=digest(data))
+              code, detail = failure_reason(data) if status == "inference_failed" else ("", "")
+              meta.update(status=status, reason=code, review_sha256=digest(data))
               manifest_path.write_text(json.dumps(meta))
-              require(status == "success", "Review failed: " + status + (failure_reason(data) if status == "inference_failed" else ""))
+              require(status == "success", "Review failed: " + status + detail)
 
 
           if __name__ == "__main__":
@@ -643,11 +730,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions: {}
+    outputs:
+      run_attempt: ${{ steps.attempt.outputs.run_attempt }}
     steps:
-      - name: Download this attempt's immutable input
+      # "Re-run failed jobs" reruns this job without rerunning capture, so the input is named after capture's attempt.
+      - name: Record this attempt
+        id: attempt
+        shell: bash
+        run: echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Download the captured input
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: pr-review-input-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr-review-input-${{ github.run_id }}-${{ needs.capture.outputs.run_attempt }}
           path: ${{ runner.temp }}/prw/
       - name: Build pinned public source without credentials
         shell: bash
@@ -684,10 +778,10 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Download this attempt's result
+      - name: Download the review job's result
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: pr-review-result-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr-review-result-${{ github.run_id }}-${{ needs.review.outputs.run_attempt }}
           path: ${{ runner.temp }}/prw-artifact/
       - name: Validate artifact and publish the review comment
         env:
@@ -715,6 +809,28 @@ jobs:
           # comment that starts with it and was written by the Actions bot.
           MARKER = "<!-- pr-agent-wrapper:review -->"
           BOT = "github-actions[bot]"
+          # A failed run adds a notice between these two lines at the top of the comment. The next review replaces the whole comment.
+          NOTICE = "<!-- pr-agent-wrapper:notice -->"
+          NOTICE_END = "<!-- pr-agent-wrapper:end-notice -->"
+          # Every sentence a failure notice can contain. The manifest selects one by status and reason code.
+          STATUS_TEXT = {
+              "not_run": "The review job stopped before PR-Agent ran.",
+              "key_validation_failed": "A provider API key is missing. The `review` job's log names the secret.",
+              "inference_failed": "PR-Agent could not produce a review.",
+              "empty_output": "PR-Agent wrote no review.",
+              "oversized_output": "The review is larger than a GitHub comment allows. The full output is in the run's artifact.",
+              "missing_model_details": "The review lacks the footer that names the model. The output is in the run's artifact.",
+          }
+          REASON_TEXT = {
+              "credits": "The provider says the account has insufficient credits.",
+              "auth": "The provider rejected the API key.",
+              "rate_limit": "The provider rate-limited the request.",
+              "timeout": "The provider timed out. Raise `ai_timeout`, lower `reasoning_effort`, or add a fallback model. For a large diff, leave files out with `ignore_globs`; the capture job's summary lists the largest files.",
+              "context": "The diff exceeds the model's context limit. Lower `max_model_tokens` or pick a larger model.",
+              "unreachable": "The runner could not reach the provider.",
+              "all_failed": "Every model in the chain failed. Check the model ID and the API key.",
+              "internal": "PR-Agent failed without a recognized provider error. Check the model ID; for a model newer than the pinned PR-Agent, set `custom_model_max_tokens`.",
+          }
 
 
           class WrapperError(ValueError):
@@ -750,7 +866,9 @@ jobs:
               require(captured["captured"] == "true", "Missing capture")
               result = {"schema": 1, "upstream": UPSTREAM, "repository": repo, "pr_number": event["number"],
                         "base": pr["base"]["sha"], "head": pr["head"]["sha"], "merge_base": captured["merge_base"],
-                        "diff_sha256": captured["diff_sha256"], "run_id": env["GITHUB_RUN_ID"], "run_attempt": env["GITHUB_RUN_ATTEMPT"]}
+                        "diff_sha256": captured["diff_sha256"], "run_id": env["GITHUB_RUN_ID"],
+                        # The attempt that captured the diff. A rerun of only the failed jobs keeps it.
+                        "run_attempt": captured["run_attempt"]}
               for key in ("base", "head", "merge_base"):
                   require(isinstance(result[key], str) and re.fullmatch(r"[0-9a-f]{40}", result[key]), "Invalid object ID")
               require(re.fullmatch(r"[0-9a-f]{64}", result["diff_sha256"]), "Invalid diff hash")
@@ -763,9 +881,10 @@ jobs:
               require(not root.is_symlink() and root.is_dir(), "Invalid artifact directory")
               require({p.name for p in root.iterdir()} == {"manifest.json", "review.diff", "review.md"}, "Unexpected artifact files")
               manifest = json.loads(read_file(root, "manifest.json", 16384))
-              require(type(manifest) is dict and set(manifest) == set(expected) | {"status", "review_sha256"}, "Invalid manifest schema")
+              require(type(manifest) is dict and set(manifest) == set(expected) | {"status", "reason", "review_sha256"}, "Invalid manifest schema")
               require(all(manifest[k] == v and type(manifest[k]) is type(v) for k, v in expected.items()), "Artifact identity mismatch")
               require(manifest["status"] in STATUSES, "Invalid review status")
+              require(manifest["reason"] == "" or (manifest["status"] == "inference_failed" and manifest["reason"] in REASON_TEXT), "Invalid failure reason")
               patch = read_file(root, "review.diff", 4 * 1024 * 1024)
               review = read_file(root, "review.md", 8 * 1024 * 1024)
               require(hashlib.sha256(patch).hexdigest() == expected["diff_sha256"], "Diff hash mismatch")
@@ -808,16 +927,33 @@ jobs:
               return found
 
 
+          def failure_notice(manifest, expected, previous):
+              # Fixed wording and validated identifiers only. `previous` is the comment's earlier text, without its notice.
+              text = REASON_TEXT.get(manifest["reason"]) or STATUS_TEXT[manifest["status"]]
+              lines = [NOTICE, "> **PR-Agent could not review commit `" + expected["head"] + "`.** " + text,
+                       "> [Run log](https://github.com/" + expected["repository"] + "/actions/runs/" + expected["run_id"] + ")"]
+              if previous:
+                  lines.append("> The review below is from an earlier run.")
+              return MARKER + "\n" + "\n".join(lines) + "\n" + NOTICE_END + "\n" + ("\n" + previous if previous else "")
+
+
+          def without_notice(body):
+              rest = body[len(MARKER):].lstrip("\n")
+              if rest.startswith(NOTICE):
+                  end = rest.find(NOTICE_END)
+                  rest = rest[end + len(NOTICE_END):].lstrip("\n") if end >= 0 else ""
+              return rest
+
+
           def publish(root, expected, client, mode="update"):
               require(mode in COMMENT_MODES, "Invalid comment mode")
               manifest, native = validate(root, expected)
-              if manifest["status"] != "success":
-                  # A failed run leaves the PR conversation alone; the review job is already red.
-                  note = "PR-Agent review produced no comment. Status: `" + manifest["status"] + "`."
+              failed = manifest["status"] != "success"
+              if failed:
+                  note = "PR-Agent review failed. Status: `" + manifest["status"] + "`."
                   if manifest["status"] in {"oversized_output", "missing_model_details"}:
                       note += " Native output is retained in this run's artifact without truncation."
                   summary(note)
-                  return None
               current = client.get_pr(expected["repository"], expected["pr_number"])
               require(current["base"]["repo"]["full_name"] == expected["repository"] and
                       current["head"]["repo"]["full_name"] == expected["repository"] and
@@ -827,6 +963,23 @@ jobs:
                   require(re.fullmatch(r"[0-9a-f]{40}", current[side]["sha"]), "Invalid current object ID")
               advanced = any(current[k]["sha"] != expected[k] for k in ("base", "head"))
               existing = own_comment(client, expected["repository"], expected["pr_number"]) if mode == "update" else None
+              if failed:
+                  if current["head"]["sha"] != expected["head"]:
+                      # The run for the newer head reports on it.
+                      summary("No failure notice posted: the PR has a newer head than this run captured.")
+                      return None
+                  # Keep the last good review and put the notice above it. No native output is posted.
+                  body = failure_notice(manifest, expected, without_notice(existing[1]) if existing else "")
+                  if len(body.encode("utf-8")) > 65000:
+                      summary("No failure notice posted: the existing comment has no room for it.")
+                      return None
+                  if existing is None:
+                      result = client.create_comment(expected["repository"], expected["pr_number"], body)
+                      summary("PR-Agent failure notice posted as a new comment.")
+                  else:
+                      result = client.update_comment(expected["repository"], existing[0], body)
+                      summary("PR-Agent failure notice added to the existing comment.")
+                  return result
               if existing and current["head"]["sha"] != expected["head"] and ("Head: `" + current["head"]["sha"] + "`") in existing[1]:
                   # A newer run already reviewed the current head. Do not overwrite it with an older review.
                   summary("PR-Agent review skipped: the comment already covers a newer head than this run captured.")

@@ -20,10 +20,14 @@ class InputTests(unittest.TestCase):
         config = review.settings(inputs())
         self.assertEqual(config["config.model"], "xai/grok-4.7")
         self.assertEqual(config["config.fallback_models"], [])
-        self.assertEqual(config["ignore.glob"], ["vendor/**"])
+        self.assertEqual(config["ignore.glob"], review.ALWAYS_IGNORED)
+        self.assertEqual(review.ALWAYS_IGNORED[0], "vendor/**")
+        self.assertIn("**/package-lock.json", review.ALWAYS_IGNORED)
         self.assertEqual(config["pr_reviewer.num_max_findings"], 3)
         self.assertEqual(config | review.FIXED, config)
-        self.assertEqual(review.settings(inputs(ignore_globs='["generated/**"]'))["ignore.glob"], ["vendor/**", "generated/**"])
+        self.assertEqual(review.settings(inputs(ignore_globs='["generated/**"]'))["ignore.glob"], [*review.ALWAYS_IGNORED, "generated/**"])
+        # A pattern the caller repeats is kept once.
+        self.assertEqual(review.settings(inputs(ignore_globs='["**/go.sum"]'))["ignore.glob"], review.ALWAYS_IGNORED)
 
     def test_invalid_model_and_json_types(self):
         for value in ["grok-4.7", "bedrock/x", "xai/a/b", "xai/a:gateway", "xai/../x", "XAI/model", "xai/a?url=x", "xai/a\n", " xai/a", None, "",
@@ -56,14 +60,14 @@ class InputTests(unittest.TestCase):
         for value in ["Do not flag a missing @Override.", "Types come from @types/node; ask user@example.com.",
                       "Ignore @pytest.fixture and @formatter:off markers.", "Use @getter and @internal tags."]:
             with self.subTest(value=value):
-                self.assertEqual(review.settings(inputs(extra_instructions=value))["pr_reviewer.extra_instructions"], review.instructions(value, ["vendor/**"]))
+                self.assertEqual(review.settings(inputs(extra_instructions=value))["pr_reviewer.extra_instructions"], review.instructions(value, review.ALWAYS_IGNORED))
         for value in ['["@str @jinja x"]', '["\\u0040jinja x"]']:
             with self.assertRaises(ValueError):
                 review.settings(inputs(ignore_globs=value))
         text = 'Focus on "the workflow", package.json and docs.\n$(touch /tmp/never) `uname` ${{ hostile }}'
-        self.assertEqual(review.settings(inputs(extra_instructions=text))["pr_reviewer.extra_instructions"], review.instructions(text, ["vendor/**"]))
+        self.assertEqual(review.settings(inputs(extra_instructions=text))["pr_reviewer.extra_instructions"], review.instructions(text, review.ALWAYS_IGNORED))
         # The model is told which files it cannot see, after the caller's own text.
-        note = 'Files matching these patterns were deliberately left out of this diff: ["vendor/**", "package-lock.json"]. Do not report them as missing, and do not report a missing change to them.'
+        note = 'Files matching these patterns were deliberately left out of this diff: ' + json.dumps([*review.ALWAYS_IGNORED, "package-lock.json"]) + '. Do not report them as missing, and do not report a missing change to them.'
         self.assertEqual(review.settings(inputs(ignore_globs='["package-lock.json"]'))["pr_reviewer.extra_instructions"], note)
         self.assertEqual(review.settings(inputs(ignore_globs='["package-lock.json"]', extra_instructions="Be brief."))["pr_reviewer.extra_instructions"], "Be brief.\n\n" + note)
         with self.assertRaises(ValueError):
@@ -71,7 +75,7 @@ class InputTests(unittest.TestCase):
 
     def test_optional_tuning_inputs(self):
         config = review.settings(inputs())
-        self.assertEqual((config["config.ai_timeout"], config["config.max_model_tokens"], config["config.response_language"]), (120, 64000, "en-US"))
+        self.assertEqual((config["config.ai_timeout"], config["config.max_model_tokens"], config["config.response_language"]), (300, 64000, "en-US"))
         for absent in ["config.custom_model_max_tokens", "config.reasoning_effort", "openai.api_base"]:
             self.assertNotIn(absent, config)
         config = review.settings(inputs(model="openai/local-model", api_base="https://llm.example.com:8443/v1", custom_model_max_tokens=128000,
@@ -250,12 +254,48 @@ class InputTests(unittest.TestCase):
             self.assertEqual((root / "artifact/review.md").read_bytes(), b"")
             self.assertEqual(json.loads((root / "artifact/manifest.json").read_text())["status"], "inference_failed")
 
+    def test_diff_summary_lists_the_largest_files_and_hides_unsafe_paths(self):
+        def entry(name, lines):
+            return ("diff --git a/" + name + " b/" + name + "\n--- a/" + name + "\n+++ b/" + name + "\n@@ -0,0 +1 @@\n" + "+x\n" * lines).encode()
+        hostile = ["x|y.txt", "a`b.txt", "<img src=x>.md", "new\\nline.txt", "$(id).sh", "\u00e9.txt"]
+        patch_bytes = b"".join([entry("src/data/big.json", 4000), entry("src/app/[id]/(group)/page two.tsx", 2000), entry("small.txt", 1),
+                                *[entry(name, 1000 + index) for index, name in enumerate(hostile)],
+                                b'diff --git "a/q\\303\\251.txt" "b/q\\303\\251.txt"\n' + b"+x\n" * 1500])
+        text = review.diff_summary(patch_bytes, [])
+        rows = [line for line in text.splitlines() if line.startswith("| ") and "KiB" in line]
+        self.assertIn("Captured diff: 10 file(s), ", text)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0], "| `src/data/big.json` | 12 KiB |")
+        self.assertEqual(rows[1], "| `src/app/[id]/(group)/page two.tsx` | 6 KiB |")
+        self.assertEqual({row.split(" | ")[0] for row in rows[2:]}, {"| (path not shown)"})
+        self.assertNotIn("left out", text)
+        for name in hostile:
+            self.assertNotIn(name, text)
+        # A diff line that only looks like a header is content, not a file.
+        self.assertIn("Captured diff: 1 file(s), ", review.diff_summary(entry("a.txt", 1) + b"+diff --git a/x b/x\n", []))
+        self.assertNotIn("Largest files", review.diff_summary(b"", []))
+
+    def test_diff_summary_reports_what_ignore_globs_leave_out(self):
+        def entry(name, lines):
+            return ("diff --git a/" + name + " b/" + name + "\n--- a/" + name + "\n+++ b/" + name + "\n@@ -0,0 +1 @@\n" + "+x\n" * lines).encode()
+        globs = review.settings(inputs(ignore_globs='["src/data/*.json", "goals/**/evidence/**"]'))["ignore.glob"]
+        patch_bytes = b"".join([entry("src/data/quotes.json", 5000), entry("goals/evidence/a.json", 900), entry("goals/voice/evidence/b.json", 800),
+                                entry("package-lock.json", 700), entry("web/package-lock.json", 600), entry("vendor/lib/x.go", 500),
+                                entry("src/app.ts", 3000), entry("src/data/readme.md", 100)])
+        text = review.diff_summary(patch_bytes, globs)
+        self.assertIn("leave out 6 file(s), ", text)
+        self.assertIn("PR-Agent receives 2 file(s), ", text)
+        sent, left = text.split("| Largest files left out | Diff size |")
+        self.assertEqual([line.split("`")[1] for line in sent.splitlines() if line.startswith("| `")], ["src/app.ts", "src/data/readme.md"])
+        self.assertEqual([line.split("`")[1] for line in left.splitlines() if line.startswith("| `")],
+                         ["src/data/quotes.json", "goals/evidence/a.json", "goals/voice/evidence/b.json", "package-lock.json", "web/package-lock.json"])
+
     def test_failed_review_reports_only_a_fixed_reason(self):
-        upstream_reason, message = next(iter(review.FAILURE_REASONS.items()))
+        upstream_reason, (code, message) = next(iter(review.FAILURE_REASONS.items()))
         known = ("Failed to review PR\n\n**Reason:** " + upstream_reason).encode()
-        for payload, suffix in [(known, ". " + message), (known + b"\n", ". " + message), (b"Failed to review PR", ""),
-                                (b"Failed to review PR\n\n**Reason:** provider said hostile\n::error::x", ""),
-                                (known + b" extra provider text", "")]:
+        for payload, suffix, reason in [(known, ". " + message, code), (known + b"\n", ". " + message, code), (b"Failed to review PR", "", ""),
+                                        (b"Failed to review PR\n\n**Reason:** provider said hostile\n::error::x", "", ""),
+                                        (known + b" extra provider text", "", "")]:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / "artifact").mkdir()
@@ -268,6 +308,7 @@ class InputTests(unittest.TestCase):
                 with patch.dict(os.environ, {"XAI_API_KEY": "stub-key"}, clear=True), patch.object(review.subprocess, "run", side_effect=runner):
                     with self.assertRaises(review.WrapperError) as raised: review.infer(root)
                 self.assertEqual(str(raised.exception), "Review failed: inference_failed" + suffix)
+                self.assertEqual(json.loads((root / "artifact/manifest.json").read_text())["reason"], reason)
 
     def test_settings_are_encoded_as_toml_literals(self):
         for value in [True, False, 0, 32000, "", "xai/grok-4.7", 'quote " backslash \\ tab \t newline \n del \x7f', "caf\u00e9 \U0001f600 \u2028",
@@ -342,13 +383,16 @@ class ProvenanceTests(unittest.TestCase):
             event_path = temp / "event.json"
             event_path.write_text(json.dumps(event()))
             output = temp / "job-output"
+            summary = temp / "job-summary"
             capture_root = temp / "capture"
             environment = {"INPUTS_JSON": json.dumps(inputs()), "GITHUB_EVENT_PATH": str(event_path),
                            "GITHUB_REPOSITORY": "example/project", "GITHUB_EVENT_NAME": "pull_request_target",
-                           "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_OUTPUT": str(output)}
+                           "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_OUTPUT": str(output),
+                           "GITHUB_STEP_SUMMARY": str(summary)}
             with patch.dict(os.environ, environment, clear=True), patch.object(review, "git_diff", return_value=("c" * 40, b"patch\n")) as capture:
                 review.prepare(capture_root)
             capture.assert_called_once()
+            self.assertIn("Captured diff: 0 file(s), 1 KiB.", summary.read_text())
             self.assertEqual(capture.call_args.args[0]["head"], "b" * 40)
             outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
             self.assertEqual(json.loads(outputs["providers"]), ["xai"])
@@ -530,9 +574,11 @@ class PublishTests(unittest.TestCase):
     def test_target_event_identity_uses_payload_shas(self):
         env = {"GITHUB_REPOSITORY": "example/project", "GITHUB_EVENT_NAME": "pull_request_target",
                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_SHA": "d" * 40,
-               "CAPTURED_JSON": json.dumps({"captured": "true", "merge_base": "c" * 40,
+               "CAPTURED_JSON": json.dumps({"captured": "true", "merge_base": "c" * 40, "run_attempt": "2",
                                             "diff_sha256": hashlib.sha256(b"patch\n").hexdigest()})}
         self.assertEqual(publisher.expected_identity(event(), env), expected())
+        # A rerun of only the failed jobs has a later attempt number; the identity keeps the attempt that captured the diff.
+        self.assertEqual(publisher.expected_identity(event(), {**env, "GITHUB_RUN_ATTEMPT": "5"}), expected())
         env["GITHUB_EVENT_NAME"] = "issue_comment"
         with self.assertRaises(ValueError):
             publisher.expected_identity(event(), env)
@@ -656,15 +702,73 @@ class PublishTests(unittest.TestCase):
                     client = self.Client([self.comment(5, publisher.MARKER + "\nlast good review")])
                     summary = root.parent / (root.name + "-summary")
                     with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
-                        self.assertIsNone(publisher.publish(root, meta, client, mode))
-                    # A failed run adds nothing to the PR and keeps the last good review.
-                    self.assertFalse(client.comments or client.updates)
+                        publisher.publish(root, meta, client, mode)
+                    # A failed run posts a fixed notice and keeps the last good review under it.
+                    notice = publisher.failure_notice({"status": status, "reason": ""}, meta, "last good review" if mode == "update" else "")
+                    self.assertIn(publisher.STATUS_TEXT[status], notice)
+                    self.assertEqual((client.comments, client.updates),
+                                     ([], [("example/project", 5, notice)]) if mode == "update" else ([("example/project", 17, notice)], []))
                     self.assertIn("Status: `" + status + "`", summary.read_text())
                     summary.unlink()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             meta = artifact(root, "x" * 60001 + footer)
             with self.assertRaises(ValueError): publisher.validate(root, meta)
+
+    def test_failure_notice_lifecycle(self):
+        footer = "\n\u2699\ufe0f Agent run details\n- Model: xai/grok-4.7\n"
+        self.assertEqual(set(publisher.STATUS_TEXT), publisher.STATUSES - {"success"})
+        self.assertEqual(publisher.REASON_TEXT, dict(review.FAILURE_REASONS.values()))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # No earlier comment: the notice is the whole comment, with the reason and a link to the run.
+            meta = artifact(root, "", "inference_failed", "timeout")
+            client = self.Client()
+            publisher.publish(root, meta, client)
+            body = client.comments[0][2]
+            self.assertTrue(body.startswith(publisher.MARKER + "\n" + publisher.NOTICE + "\n> **PR-Agent could not review commit `" + "b" * 40 + "`.** The provider timed out."))
+            self.assertIn("> [Run log](https://github.com/example/project/actions/runs/123)\n" + publisher.NOTICE_END, body)
+            self.assertNotIn("earlier run", body)
+            # A second failure replaces the notice instead of stacking a new one.
+            artifact(root, "", "empty_output")
+            client = self.Client([self.comment(5, body)])
+            publisher.publish(root, meta, client)
+            again = client.updates[0][2]
+            self.assertEqual(again.count(publisher.NOTICE), 1)
+            self.assertIn(publisher.STATUS_TEXT["empty_output"], again)
+            self.assertNotIn("timed out", again)
+            # A failure after a good review keeps that review, and a second failure does not duplicate it.
+            artifact(root)
+            client = self.Client()
+            publisher.publish(root, meta, client)
+            good = client.comments[0][2]
+            artifact(root, "", "inference_failed", "auth")
+            for existing in [good, None]:
+                client = self.Client([self.comment(5, existing or noticed)])
+                publisher.publish(root, meta, client)
+                noticed = client.updates[0][2]
+                self.assertEqual(noticed, publisher.failure_notice({"status": "inference_failed", "reason": "auth"}, meta, good[len(publisher.MARKER) + 1:]))
+                self.assertTrue(noticed.endswith(good[len(publisher.MARKER) + 1:]))
+                self.assertIn("> The review below is from an earlier run.", noticed)
+            # The next good review replaces the notice.
+            artifact(root)
+            client = self.Client([self.comment(5, noticed)])
+            publisher.publish(root, meta, client)
+            self.assertEqual(client.updates[0][2], good)
+            # A failed run for a head the PR has moved past stays quiet; the newer run reports.
+            artifact(root, "", "inference_failed", "timeout")
+            client = self.Client([self.comment(5, good)])
+            client.current = {**client.current, "head": {**client.current["head"], "sha": "e" * 40}}
+            self.assertIsNone(publisher.publish(root, meta, client))
+            self.assertFalse(client.comments or client.updates)
+            # A comment with no room for the notice is left alone.
+            client = self.Client([self.comment(5, publisher.MARKER + "\n" + "x" * 64900)])
+            self.assertIsNone(publisher.publish(root, meta, client))
+            self.assertFalse(client.comments or client.updates)
+            # The reason is a known code, and only an inference failure carries one.
+            for status, reason in [("inference_failed", "SENTINEL"), ("empty_output", "timeout"), ("success", "timeout")]:
+                artifact(root, "" if status != "success" else "Native review" + footer, status, reason)
+                with self.assertRaises(ValueError): publisher.validate(root, meta)
 
     def test_post_failure_is_not_retried(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -712,8 +816,14 @@ class WorkflowTests(unittest.TestCase):
             for step in job["steps"]:
                 self.assertNotEqual(step.get("uses", "").partition("@")[0].lower(), "actions/checkout")
                 self.assertNotIn("${{", step.get("run", ""))
-        build = reviewer["steps"][1]
-        keyed = reviewer["steps"][2]
+        build = reviewer["steps"][2]
+        keyed = reviewer["steps"][3]
+        # Artifacts are named after the attempt that made them, so a rerun of only the failed jobs finds them.
+        run = "${{ github.run_id }}-${{ "
+        self.assertEqual([step["with"]["name"] for job in [capture, reviewer, publisher_job] for step in job["steps"] if "artifact" in step.get("uses", "")],
+                         ["pr-review-input-" + run + "github.run_attempt }}", "pr-review-input-" + run + "needs.capture.outputs.run_attempt }}",
+                          "pr-review-result-" + run + "github.run_attempt }}", "pr-review-result-" + run + "needs.review.outputs.run_attempt }}"])
+        self.assertEqual(reviewer["steps"][0]["run"], 'echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"')
         self.assertNotIn("env", build)
         self.assertEqual(set(keyed["env"]), {public for public, _ in review.KEYS.values()})
         for provider, (public, _) in review.KEYS.items():
