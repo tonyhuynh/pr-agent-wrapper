@@ -389,8 +389,11 @@ class ProvenanceTests(unittest.TestCase):
                            "GITHUB_REPOSITORY": "example/project", "GITHUB_EVENT_NAME": "pull_request_target",
                            "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_OUTPUT": str(output),
                            "GITHUB_STEP_SUMMARY": str(summary)}
-            with patch.dict(os.environ, environment, clear=True), patch.object(review, "git_diff", return_value=("c" * 40, b"patch\n")) as capture:
+            log = io.StringIO()
+            with patch.dict(os.environ, environment, clear=True), patch.object(review, "git_diff", return_value=("c" * 40, b"patch\n")) as capture, redirect_stdout(log):
                 review.prepare(capture_root)
+            # The same report goes to the job log and the job summary.
+            self.assertEqual(log.getvalue(), summary.read_text() + "\n")
             capture.assert_called_once()
             self.assertIn("Captured diff: 0 file(s), 1 KiB.", summary.read_text())
             self.assertEqual(capture.call_args.args[0]["head"], "b" * 40)

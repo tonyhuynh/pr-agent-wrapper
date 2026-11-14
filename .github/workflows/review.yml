@@ -545,9 +545,11 @@ jobs:
                   require(re.fullmatch(r"[1-9][0-9]*", value), "Invalid run identity")
                   meta[key] = value
               merge_base, patch = git_diff(meta, root, os.environ.get("GH_READ_TOKEN", ""))
+              report = diff_summary(patch, config["ignore.glob"])
+              print(report)
               if os.environ.get("GITHUB_STEP_SUMMARY"):
                   with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-                      f.write(diff_summary(patch, config["ignore.glob"]))
+                      f.write(report)
               meta.update({"schema": 1, "upstream": UPSTREAM, "merge_base": merge_base, "diff_sha256": digest(patch),
                            "status": "not_run", "reason": "", "review_sha256": digest(b"")})
               (root / "input").mkdir()
