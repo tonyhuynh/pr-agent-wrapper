@@ -135,15 +135,17 @@ Only `model` is required.
 | `fallback_models` | `'[]'` | JSON array string of up to 4 more models; no duplicates, and not the primary |
 | `extra_instructions` | Empty | Text added to the review prompt, up to 8 KiB |
 | `num_max_findings` | `3` | Most findings to report, 1 to 10 |
-| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` always stays excluded. The prompt tells the model these files were left out, so it does not report them as missing |
+| `ignore_globs` | `'["vendor/**"]'` | JSON array string of paths to leave out of the review; up to 32 patterns of 256 bytes each. `vendor/**` and dependency lockfiles (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `go.sum`, and any `.lock` file) are always left out. The prompt tells the model these files were left out, so it does not report them as missing |
 | `comment_mode` | `update` | `update` edits this workflow's previous comment; `new` adds a comment per run |
 | `response_language` | `en-US` | Language of the review, as a locale such as `pt-BR`. PR-Agent also translates the comment's fixed labels for the languages it ships, currently Spanish |
 | `reasoning_effort` | Empty | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; empty keeps PR-Agent's default |
 | `max_model_tokens` | `64000` | Cap on tokens PR-Agent sends to the model, 4000 to 2000000. PR-Agent's own default is 32000 |
-| `ai_timeout` | `120` | Seconds allowed per model call, 30 to 540 |
+| `ai_timeout` | `300` | Seconds allowed per model call, 30 to 540 |
 | `large_pr_chunking` | `false` | When a diff does not fit `max_model_tokens`, split it and review it in up to 3 model calls instead of leaving files out |
 | `api_base` | Empty | HTTPS URL of an OpenAI-compatible endpoint, on a public host name. IP addresses and local names are rejected. Needs an `openai/` model |
 | `custom_model_max_tokens` | `0` | Context size for a model PR-Agent does not know, 1000 to 2000000; 0 leaves it unset |
+
+`ignore_globs` patterns match the file's path from the repository root, the way `fnmatch` does: `*` also crosses `/`, and a `**/` segment matches any number of directories, including none. So `package-lock.json` matches only the root file, `**/package-lock.json` matches it at any depth, and `goals/**/evidence/**` matches `goals/evidence/a.png` and `goals/x/evidence/a.png`. PR-Agent applies the patterns after the diff is captured, so the run's artifact always holds the full diff; the `capture` job's summary shows the size that is left.
 
 Text inputs cannot start with an at sign or contain a Dynaconf directive such as `@json` or `@format`, because PR-Agent's settings loader would evaluate it. Mentions like `@Override` or `@types/node` inside a sentence are fine.
 
@@ -151,9 +153,10 @@ Text inputs cannot start with an at sign or contain a Dynaconf directive such as
 
 - **One comment.** It starts with the repository, PR number, base SHA, head SHA, and a hash of the diff that was reviewed, followed by PR-Agent's review. In `update` mode the workflow edits its own latest comment, which it recognizes by a hidden marker and the `github-actions[bot]` author. In `new` mode every run, including a rerun, adds a comment.
 - **Pushes during a review.** If the PR moved while a review was running, the comment says so and still names the commits it covers. If a newer run already reviewed the newer head, the older run writes nothing.
-- **Failures stay off the PR.** A failed review fails the job and writes the reason to the job summary. The last good review stays in place.
+- **A failed review leaves a short notice.** The job fails, and the comment gets a few lines at the top that name the commit, give the reason in fixed wording, and link the run. The last good review stays below the notice, and the next good review replaces both. A failed run for a commit the PR has already moved past posts nothing.
 - **A run takes about two minutes.** Each run builds PR-Agent from source, which is about one minute of that.
-- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. Raise `max_model_tokens` to cover them. The review then costs more and takes longer, so it may need a higher `ai_timeout` too. If the diff still does not fit, or the model's context is small, set `large_pr_chunking: true`. PR-Agent then reviews the diff in up to 3 model calls and merges the results. It can miss an issue that spans two of them.
+- **Large PRs can outgrow the token budget.** PR-Agent then leaves some files out and lists them at the end of the comment. First check the `capture` job's summary, which lists the largest files in the diff and what `ignore_globs` already leaves out, and leave generated or data files out with `ignore_globs`. To cover what remains, raise `max_model_tokens`. The review then costs more and takes longer, so it may need a higher `ai_timeout` too. If the diff still does not fit, or the model's context is small, set `large_pr_chunking: true`. PR-Agent then reviews the diff in up to 3 model calls and merges the results. It can miss an issue that spans two of them.
+- **A slow review is usually a slow model, not a big diff.** A reasoning model's time depends mostly on how much it writes and reasons. If reviews time out on modest diffs, lower `reasoning_effort`, add a fallback model from another provider, or raise `ai_timeout`.
 - **Your provider sees the diff.** The diff and review are also kept as workflow artifacts for 3 days. See [SECURITY.md](SECURITY.md) before using this on code that must not leave the repository.
 
 ### Example comment
@@ -192,21 +195,23 @@ The real comment prints full SHAs and renders as Markdown, with PR-Agent's table
 
 ## When something goes wrong
 
-Open the failed run. Errors appear as an annotation titled "PR-Agent wrapper", and the `publish` job's summary repeats the review status.
+Open the failed run. Errors appear as an annotation titled "PR-Agent wrapper". The run's summary shows the size of the diff, its largest files, what `ignore_globs` left out, and the review status. The PR comment carries the same reason.
+
+"Re-run failed jobs" repeats the review on the diff the run already captured. GitHub reruns a workflow with the settings the run started with, so after you change the caller file, push a new commit to the PR or close and reopen it.
 
 | What you see | Cause | Fix |
 | --- | --- | --- |
 | All three jobs skipped | The PR is a draft, comes from a fork, or the event is not one of the four supported types | Mark the PR ready for review. Fork PRs are not reviewed |
 | ``Invalid input `name`: ...`` in `capture` | An input broke the rule named in the message. The value is never printed | Fix that input; the [Inputs](#inputs) table has the limits |
 | `Review failed: key_validation_failed` | A provider in your chain has no key, or the caller did not pass it under `secrets:`. The `review` job log names it: `Missing required workflow secret: NAME` | Add the secret to the repository and pass it in the caller |
-| `Review failed: inference_failed` | PR-Agent could not produce a review. When PR-Agent recognizes the cause (rejected key, no credits, rate limit, timeout, context limit, unreachable provider), the message ends with it | Follow the reason. With no reason, check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
+| `Review failed: inference_failed` | PR-Agent could not produce a review. When PR-Agent recognizes the cause (rejected key, no credits, rate limit, timeout, context limit, unreachable provider), the message ends with it | Follow the reason. For a timeout, raise `ai_timeout`, lower `reasoning_effort`, or add a fallback model; rerunning unchanged often times out again. With no reason, check the model ID and key with the provider. For a new or self-hosted model, set `custom_model_max_tokens` |
 | `Review failed: empty_output` | PR-Agent wrote no review | Rerun. If it repeats, check that `ignore_globs` does not exclude every changed file |
 | `Review failed: oversized_output` | The review is larger than a GitHub comment allows | Lower `num_max_findings`. The full output is in the run's artifact |
 | `Review failed: missing_model_details` | The review lacks the footer that names the model, so its origin cannot be confirmed | Rerun. The output is in the run's artifact |
 | `Ambiguous or missing merge base` in `capture` | The branch history has more than one merge base with the target | Rebase or merge the target branch into the PR |
 | `Diff exceeds 4 MiB` in `capture` | The PR is too large to review | Split the PR. `ignore_globs` applies later and does not lower this size |
 
-The reason after `inference_failed` is one of a few fixed sentences. Provider error text can contain credentials, so the workflow never logs it.
+The reason after `inference_failed` is one of a few fixed sentences. Provider error text can contain credentials, so the workflow never logs it or posts it.
 
 ## How it works
 

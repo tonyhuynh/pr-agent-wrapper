@@ -88,7 +88,7 @@ class ConfigSemanticsTests(unittest.TestCase):
                 for key, value in config.items():
                     self.assertEqual(settings.get(key), value, key)
                 self.assertEqual(settings.config.fallback_models, fallbacks)
-                self.assertEqual(settings.ignore.glob, ["vendor/**"])
+                self.assertEqual(settings.ignore.glob, review.ALWAYS_IGNORED)
                 self.assertEqual(settings.config.model, "xai/grok-4.7")
                 self.assertFalse(settings.config.get("use_repo_settings_file"))
 
@@ -132,6 +132,35 @@ class ConfigSemanticsTests(unittest.TestCase):
                 self.assertEqual(str(settings.get("TEXT")), "49")
             with self.assertRaises(ValueError):
                 review.settings(inputs(extra_instructions=payload))
+
+    def test_ignore_globs_match_as_the_pinned_filter_does(self):
+        import fnmatch
+        from collections.abc import Mapping
+        pinned = functions("pr_agent/algo/file_filter.py", ["_globstar_offsets", "_translate_globs_to_regexes_with_status"],
+                           {"fnmatch": fnmatch, "Mapping": Mapping, "get_logger": lambda: Mock(), "_MAX_ENUMERATED_GLOBSTARS": 6,
+                            "_MAX_IGNORE_GLOB_VARIANT_REGEXES": 256, "_MAX_EXPANDED_GLOB_LENGTH": 256, "_MAX_GLOB_LENGTH": 1024})
+        constants = {node.targets[0].id: node.value.value for node in ast.parse(upstream("pr_agent/algo/file_filter.py")).body
+                     if isinstance(node, ast.Assign) and node.targets[0].id.startswith("_MAX_")}
+        self.assertEqual(constants, {"_MAX_ENUMERATED_GLOBSTARS": 6, "_MAX_IGNORE_GLOB_VARIANT_REGEXES": 256,
+                                     "_MAX_EXPANDED_GLOB_LENGTH": 256, "_MAX_GLOB_LENGTH": 1024})
+        paths = ["package-lock.json", "web/package-lock.json", "a/b/pnpm-lock.yaml", "go.sum", "svc/go.sum", "docs/go.summary",
+                 "mypackage-lock.json", "src/package-lock.json.ts", "vendor/x.go", "src/vendor/x.go", "src/data/a.json", "src/data/deep/a.json",
+                 "src/data/a.md", "goals/evidence/a.png", "goals/voice/evidence/a.png", "goals/a/b/evidence/c/d.json", "goals/evidence.md",
+                 "evidence/a.png", "a/b/c.py", "c.py", "a[1]/x.py", "a1/x.py", "src/app.ts"]
+        chosen = [*review.ALWAYS_IGNORED, "src/data/*.json", "goals/**/evidence/**", "package-lock.json", "**/*.py", "a[1]/**/x.py",
+                  "a[**/]/x", "**/a/**/b/**/c.py", "**/" * 7 + "x.md", "docs/**"]
+        for globs in [[one] for one in chosen] + [chosen, review.ALWAYS_IGNORED]:
+            with self.subTest(globs=globs):
+                regexes, complete = pinned["_translate_globs_to_regexes_with_status"](globs)
+                theirs = [path for path in paths if any(re.compile(regex).match(path) for regex in regexes)]
+                ours = [path for path in paths if any(pattern.match(path) for pattern in review.ignore_patterns(globs))]
+                self.assertEqual(ours, theirs)
+        # The cases callers rely on: nested and zero-depth "**/", root files, and the built-in lockfile patterns.
+        def left_out(globs):
+            return [path for path in paths if any(pattern.match(path) for pattern in review.ignore_patterns(globs))]
+        self.assertEqual(left_out(["goals/**/evidence/**"]), ["goals/evidence/a.png", "goals/voice/evidence/a.png", "goals/a/b/evidence/c/d.json"])
+        self.assertEqual(left_out(["package-lock.json"]), ["package-lock.json"])
+        self.assertEqual(left_out(review.ALWAYS_IGNORED), ["package-lock.json", "web/package-lock.json", "a/b/pnpm-lock.yaml", "go.sum", "svc/go.sum", "vendor/x.go"])
 
     def test_failure_reasons_match_pinned_source(self):
         values = {}
